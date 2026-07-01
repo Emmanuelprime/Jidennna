@@ -1,0 +1,32 @@
+name: "indoor_delivery"
+description: "Indoor delivery scenario with pedestrians and static obstacles"
+
+robot_start:
+  position: [0.0, 0.0, 0.0]
+
+environment:
+  size: [20.0, 15.0]
+  ground_type: "indoor_floor"
+  walls: true
+
+pedestrians:
+  - start_position: [5.0, 2.0]
+    goal_position: [-5.0, -2.0]
+    speed: 1.0
+  - start_position: [-3.0, 4.0]
+    goal_position: [3.0, -4.0]
+    speed: 1.2
+  - start_position: [2.0, -3.0]
+    goal_position: [-2.0, 3.0]
+    speed: 0.8
+
+static_obstacles:
+  - position: [1.0, 1.0]
+    radius: 0.3
+    type: "chair"
+  - position: [-1.0, 2.0]
+    radius: 0.4
+    type: "table"
+  - position: [3.0, -2.0]
+    radius: 0.5
+    type: "delivery_box"

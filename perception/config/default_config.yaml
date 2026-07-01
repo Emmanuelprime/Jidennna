@@ -1,0 +1,77 @@
+# Default perception configuration
+
+pipeline_frequency: 30
+enable_visualization: true
+use_simulation: false
+robot_radius: 0.3
+
+camera:
+  width: 640
+  height: 480
+  fps: 30
+  use_simulation: false
+  camera_type: "usb"
+  device_id: 0
+  fx: 615.0
+  fy: 615.0
+  cx: 320.0
+  cy: 240.0
+  camera_height: 1.2
+  camera_pitch: -15.0
+  camera_x_offset: 0.1
+
+detection:
+  model_type: "yolov8"
+  model_path: "models/yolov8n.pt"
+  confidence_threshold: 0.5
+  nms_threshold: 0.45
+  input_size: [640, 640]
+  use_tensorrt: false
+  device: "auto"
+  classes_of_interest:
+    - person
+    - bicycle
+    - car
+    - motorcycle
+    - bus
+    - truck
+    - dog
+    - cat
+    - backpack
+    - suitcase
+
+tracking:
+  tracker_type: "bytetrack"
+  max_age: 30
+  min_hits: 3
+  iou_threshold: 0.3
+  use_kalman_filter: true
+  process_noise: 0.01
+  measurement_noise: 0.1
+
+mapping:
+  grid_width: 200
+  grid_height: 200
+  resolution: 0.05
+  update_frequency: 10.0
+  obstacle_inflation_radius: 0.3
+  occupied_threshold: 0.65
+  free_threshold: 0.2
+
+localization:
+  use_imu: true
+  use_wheel_odometry: true
+  wheel_separation: 0.521
+  wheel_radius: 0.085
+
+visualization:
+  enabled: true
+  show_detections: true
+  show_tracks: true
+  show_occupancy_grid: true
+  show_robot_pose: true
+
+logging:
+  log_level: "INFO"
+  log_file: "logs/perception.log"
+  record_data: false
