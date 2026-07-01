@@ -1,41 +1,84 @@
 /**
- * diff_drive.ino  –  Differential-drive velocity controller
- * ==========================================================
- * Receives CMD_VEL:v,w  (m/s, rad/s) over serial and drives both
- * wheels at the corresponding speeds using PID + feedforward.
- *
- * Velocity limits (right motor, no-load experiments):
- *   Single wheel max : 0.65 m/s
- *   Linear max       : 0.65 m/s
- *   Angular max      : 0.65 / (L/2)  ≈  2.49 rad/s
- *
- * If CMD_VEL would exceed either wheel's limit the command is
- * uniformly scaled down while preserving the v/w ratio.
+ * diff_drive.ino  –  Differential-drive velocity controller  (v2)
+ * ================================================================
+ * Receives CMD_VEL:v,w  (m/s, rad/s) and drives both wheels at the
+ * corresponding speeds using feedforward + PID velocity control.
  *
  * Kinematics  (L = WHEEL_SEPARATION_M = 0.521 m):
  *   v_left  = v - w * (L/2)
  *   v_right = v + w * (L/2)
  *
- * Motor models  (from first-order system-identification experiments):
+ * Motor models  (first-order system-ID, no-load):
  *   Left  : v = 0.0402 * PWM - 0.3415   τ = 0.204 s
  *   Right : v = 0.0127 * PWM + 0.0059   τ = 0.219 s
  *
- * Serial protocol (115200 baud, LF-terminated):
- *   Host → ESP32
- *     PING              → READY
- *     CMD_VEL:v,w       → (silent, low-latency)
- *     STOP              → STOPPED  + motors off
- *     STREAM_ON         → STREAM_ON
- *     STREAM_OFF        → STREAM_OFF
- *     RESET_ODOM        → ODOM_RESET
- *     STATUS            → STATUS,ctrl,stream,Lkp,Lki,Lkd,Rkp,Rki,Rkd
- *     TUNE:kp,ki,kd     → PID both …
- *     TUNEL:kp,ki,kd    → PID left …
- *     TUNER:kp,ki,kd    → PID right …
+ * ── IMPROVEMENTS OVER v1 ──────────────────────────────────────────
  *
- *   ESP32 → Host  (20 Hz when streaming)
- *     ODOM,t_ms,l_spd,r_spd,l_pwm,r_pwm,l_sp,r_sp,v,w,x,y,yaw
- *     WATCHDOG          (if CMD_VEL timeout exceeded)
+ * 1. Speed low-pass filter  (EMA, α = 0.4)
+ *    Raw encoder counts over a 50 ms window are noisy at low speeds
+ *    (1 pulse = 0.0058 m → 0.115 m/s at 20 Hz).  An exponential
+ *    moving average with α = 0.4 (τ ≈ 75 ms) smooths this noise
+ *    without adding excessive lag.
+ *
+ * 2. Derivative-on-measurement  +  derivative low-pass filter
+ *    D = -Kd * d(measured)/dt eliminates the derivative kick that
+ *    occurs every time the setpoint steps (direction change, ramp
+ *    increment).  A secondary EMA (α = 0.3) further smooths high-
+ *    frequency encoder noise in the D term.
+ *
+ * 3. Clamping anti-windup
+ *    Integration is paused when the output is at its limit AND the
+ *    integrator would push it further into saturation.  This stops
+ *    integral wind-up during startup, saturation, and direction
+ *    transitions without needing a conditional reset.
+ *
+ * 4. Tighter PID limits  (output ±15, integral = output_limit / Ki)
+ *    The feedforward provides the bulk of the PWM command; the PID
+ *    only corrects the residual error (~10-20% of speed).  Capping
+ *    the PID output at ±15 and sizing the integral limit so it alone
+ *    can never saturate the output prevents authority fight between
+ *    FF and PID.
+ *
+ * 5. Full PID state reset on direction reversal
+ *    When a wheel direction changes: integral, setpoint, derivative
+ *    state (last_measured + filtered_deriv), speed estimate, and
+ *    slewed PWM are all zeroed.  This:
+ *      a) Prevents derivative spikes from the sign flip.
+ *      b) Ensures the setpoint ramp always starts from 0.
+ *      c) Prevents integral wind-up from the opposite direction.
+ *      d) Stops the slewed PWM carrying momentum into the new direction.
+ *
+ * 6. PWM slew-rate limiter  (300 PWM/s)
+ *    The final PWM command is limited to change by at most
+ *    300 PWM-units/s.  Running at ~1 kHz this means the output can
+ *    change 0.3 PWM per ms → 0 to 60 in 200 ms.  This absorbs the
+ *    FF dead-zone jump at startup and prevents any sudden motor jolt.
+ *
+ * ── KNOWN LIMITATION ──────────────────────────────────────────────
+ *    Single-channel encoders cannot detect actual rotation direction.
+ *    Direction is inferred from the commanded motor direction pin.
+ *    If the motor is still coasting in the old direction when the pin
+ *    changes, the speed estimate will be wrong for ~1 mechanical time
+ *    constant (τ ≈ 0.2 s).  The full state reset + ramp + slew rate
+ *    limiter mitigates this in practice.  A hardware fix (quadrature
+ *    encoder) would eliminate it entirely.
+ *
+ * ── SERIAL PROTOCOL  (115200 baud, LF-terminated) ─────────────────
+ *  Host → ESP32
+ *    PING              → READY
+ *    CMD_VEL:v,w       → (silent – low latency)
+ *    STOP              → STOPPED
+ *    STREAM_ON         → STREAM_ON
+ *    STREAM_OFF        → STREAM_OFF
+ *    RESET_ODOM        → ODOM_RESET
+ *    STATUS            → STATUS,ctrl,stream,Lkp,Lki,Lkd,Rkp,Rki,Rkd
+ *    TUNE:kp,ki,kd     → PID both …
+ *    TUNEL:kp,ki,kd    → PID left …
+ *    TUNER:kp,ki,kd    → PID right …
+ *
+ *  ESP32 → Host  (20 Hz when streaming)
+ *    ODOM,t_ms,l_spd,r_spd,l_pwm,r_pwm,l_sp,r_sp,v,w,x,y,yaw
+ *    WATCHDOG          (CMD_VEL timeout)
  */
 
 #include <Arduino.h>
@@ -44,11 +87,11 @@
 // ─── Pin map ──────────────────────────────────────────────────────────────────
 #define LEFT_PWM      25
 #define LEFT_DIR      26
-#define LEFT_SC       34   // speed-counter (encoder A)
+#define LEFT_SC       34   // speed-counter (single-channel encoder)
 
 #define RIGHT_PWM     27
 #define RIGHT_DIR     33
-#define RIGHT_SC      35   // speed-counter (encoder A)
+#define RIGHT_SC      35
 
 #define LEFT_PWM_CH    2
 #define RIGHT_PWM_CH   1
@@ -63,22 +106,31 @@
 #define METERS_PER_PULSE    (PI * WHEEL_DIAMETER_M / PULSES_PER_REV)
 #define HALF_TRACK          (WHEEL_SEPARATION_M * 0.5f)
 
-// ─── Velocity limits  (right-motor limited) ───────────────────────────────────
-#define V_WHEEL_MAX  0.65f              // m/s  per wheel
-#define V_MAX        V_WHEEL_MAX        // m/s  linear
-#define W_MAX        (V_WHEEL_MAX / HALF_TRACK)  // rad/s  ≈ 2.49
+// ─── Velocity limits  (right-motor limited, no-load) ─────────────────────────
+#define V_WHEEL_MAX  0.65f
+#define V_MAX        V_WHEEL_MAX
+#define W_MAX        (V_WHEEL_MAX / HALF_TRACK)   // ≈ 2.49 rad/s
 
-// ─── Acceleration limit ──────────────────────────────────────────────────────
-// Ramp setpoints at this rate to prevent jolt on startup / step changes.
-// 0.4 m/s²  → reaches 0.4 m/s in 1 s;  step per 50 ms cycle = 0.02 m/s
-#define MAX_ACCEL_MS2  0.4f
+// ─── Control tuning constants ─────────────────────────────────────────────────
+// Setpoint ramp: 0.6 m/s² → 0 to 0.2 m/s in ~333 ms.
+#define MAX_ACCEL_MS2       0.6f
+
+// PWM slew: 300 PWM/s at 1 kHz → 0.3 PWM/ms → 0 to 60 in 200 ms.
+#define PWM_SLEW_RATE       300.0f
+
+// Speed EMA: α=0.4 → time constant ≈ 75 ms.
+#define SPEED_FILTER_ALPHA  0.4f
+
+// Derivative EMA: α=0.3 → stronger noise suppression on the D term.
+#define DERIV_FILTER_ALPHA  0.3f
 
 // ─── Timing ───────────────────────────────────────────────────────────────────
 #define SPEED_CALC_US    50000UL   // 50 ms → 20 Hz speed update
 #define ODOM_STREAM_MS   50UL      // 50 ms → 20 Hz telemetry
-#define CMD_TIMEOUT_MS   500UL     // watchdog: stop if silent > 500 ms
+#define CMD_TIMEOUT_MS   500UL     // watchdog: stop if no CMD_VEL for 500 ms
+#define CTRL_MIN_US      1000UL    // control loop floor: 1 kHz
 
-// ─── Encoder debounce ─────────────────────────────────────────────────────────
+// ─── Encoder debounce ────────────────────────────────────────────────────────
 #define DEBOUNCE_US  1000UL
 
 // ─── Direction polarity ───────────────────────────────────────────────────────
@@ -90,9 +142,10 @@ struct PIDController {
   float Kp, Ki, Kd;
   float setpoint;
   float integral;
-  float last_error;
+  float last_measured;     // previous measurement for derivative-on-measurement
+  float filtered_deriv;    // low-pass filtered derivative
   float output;
-  float integral_limit;
+  float integral_limit;    // = output_limit / Ki  → I alone never saturates output
   float output_limit;
   unsigned long last_update_us;
 };
@@ -105,16 +158,16 @@ volatile unsigned long lastRightUS = 0;
 volatile bool          leftFwd     = true;
 volatile bool          rightFwd    = true;
 
-float leftSpeed  = 0.0f;
+float leftSpeed  = 0.0f;   // EMA-filtered wheel speed (m/s, signed)
 float rightSpeed = 0.0f;
-int   leftPWM    = 0;
+int   leftPWM    = 0;      // last applied PWM (for telemetry only)
 int   rightPWM   = 0;
 
 unsigned long lastSpeedCalcUS = 0;
 long lastLeftPulses  = 0;
 long lastRightPulses = 0;
 
-// Odometry (dead-reckoning from encoders)
+// Dead-reckoning odometry
 float odomX   = 0.0f;
 float odomY   = 0.0f;
 float odomYaw = 0.0f;
@@ -124,14 +177,19 @@ float odomW   = 0.0f;
 PIDController leftPID;
 PIDController rightPID;
 
-// Commanded targets — PID setpoints ramp toward these each speed cycle
+// Setpoint targets: PID setpoints ramp toward these each speed cycle
 float leftTargetSP  = 0.0f;
 float rightTargetSP = 0.0f;
+
+// Slewed PWM outputs (float for sub-step precision in slew limiter)
+float leftPWMSlewed  = 0.0f;
+float rightPWMSlewed = 0.0f;
 
 bool          streaming        = false;
 bool          speedCtrlEnabled = false;
 unsigned long lastStreamMS     = 0;
 unsigned long lastCmdVelMS     = 0;
+unsigned long lastCtrlUS       = 0;   // control-loop dt tracking
 
 // ─── ISRs ─────────────────────────────────────────────────────────────────────
 void IRAM_ATTR leftISR() {
@@ -151,10 +209,17 @@ void IRAM_ATTR rightISR() {
 }
 
 // ─── PID ──────────────────────────────────────────────────────────────────────
+
 void pidInit(PIDController& pid, float kp, float ki, float kd,
              float ilim, float olim) {
-  pid.Kp = kp; pid.Ki = ki; pid.Kd = kd;
-  pid.setpoint = pid.integral = pid.last_error = pid.output = 0.0f;
+  pid.Kp             = kp;
+  pid.Ki             = ki;
+  pid.Kd             = kd;
+  pid.setpoint       = 0.0f;
+  pid.integral       = 0.0f;
+  pid.last_measured  = 0.0f;
+  pid.filtered_deriv = 0.0f;
+  pid.output         = 0.0f;
   pid.integral_limit = ilim;
   pid.output_limit   = olim;
   pid.last_update_us = micros();
@@ -168,27 +233,54 @@ float pidUpdate(PIDController& pid, float measured) {
 
   float error = pid.setpoint - measured;
 
-  pid.integral = constrain(pid.integral + error * dt,
-                           -pid.integral_limit, pid.integral_limit);
+  // ── Proportional ────────────────────────────────────────────────────────
+  float P = pid.Kp * error;
 
-  float deriv = (error - pid.last_error) / dt;
-  pid.last_error = error;
+  // ── Derivative on measurement  +  low-pass filter ───────────────────────
+  // Using -d(measured)/dt instead of d(error)/dt means setpoint steps
+  // (ramp increments, direction changes, new CMD_VEL) do NOT produce a
+  // derivative spike.  Only actual changes in wheel speed affect D.
+  // The EMA further suppresses encoder quantisation noise.
+  float raw_deriv = -(measured - pid.last_measured) / dt;
+  pid.filtered_deriv = DERIV_FILTER_ALPHA * raw_deriv
+                     + (1.0f - DERIV_FILTER_ALPHA) * pid.filtered_deriv;
+  float D = pid.Kd * pid.filtered_deriv;
+  pid.last_measured = measured;
 
-  pid.output = constrain(pid.Kp * error + pid.Ki * pid.integral + pid.Kd * deriv,
+  // ── Clamping anti-windup ─────────────────────────────────────────────────
+  // Do not integrate when the output is already at its limit AND the
+  // integrator would push it further into saturation.  This prevents
+  // runaway wind-up during startup, large disturbances, and direction
+  // transitions without needing explicit manual resets everywhere.
+  float I          = pid.Ki * pid.integral;
+  float output_est = P + I + D;
+  bool pos_sat = (output_est >=  pid.output_limit);
+  bool neg_sat = (output_est <= -pid.output_limit);
+  bool windup  = (pos_sat && error > 0.0f) || (neg_sat && error < 0.0f);
+  if (!windup) {
+    pid.integral = constrain(pid.integral + error * dt,
+                             -pid.integral_limit, pid.integral_limit);
+  }
+
+  pid.output = constrain(P + pid.Ki * pid.integral + D,
                          -pid.output_limit, pid.output_limit);
   return pid.output;
 }
 
-// ─── Feedforward (inverted linear steady-state model) ─────────────────────────
-// Clamp to 0 when |setpoint| < dead-zone so motors stop cleanly at v=0.
+// ─── Feedforward (inverted motor model) ───────────────────────────────────────
+// fabsf(v): direction is handled by the direction pin; FF computes the
+// PWM magnitude only.  Threshold 0.05 m/s keeps the motor off below the
+// model's dead-zone (~PWM 8-9 for the left motor).
 inline float leftFF(float v) {
-  return (fabsf(v) > 0.05f) ? (v + 0.3415f) / 0.0402f : 0.0f;
+  float s = fabsf(v);
+  return (s > 0.05f) ? (s + 0.3415f) / 0.0402f : 0.0f;
 }
 inline float rightFF(float v) {
-  return (fabsf(v) > 0.05f) ? (v - 0.0059f) / 0.0127f : 0.0f;
+  float s = fabsf(v);
+  return (s > 0.05f) ? (s - 0.0059f) / 0.0127f : 0.0f;
 }
 
-// ─── Low-level motor helpers ──────────────────────────────────────────────────
+// ─── Motor helpers ────────────────────────────────────────────────────────────
 void setLeftDir(bool fwd) {
   digitalWrite(LEFT_DIR, fwd ? LEFT_FORWARD : !LEFT_FORWARD);
   leftFwd = fwd;
@@ -210,13 +302,15 @@ void applyRightPWM(int pwm) {
 }
 
 void stopMotors() {
-  speedCtrlEnabled    = false;
-  leftTargetSP        = 0.0f;
-  rightTargetSP       = 0.0f;
-  leftPID.setpoint    = 0.0f;
-  rightPID.setpoint   = 0.0f;
-  leftPID.integral    = 0.0f;
-  rightPID.integral   = 0.0f;
+  speedCtrlEnabled       = false;
+  leftTargetSP           = 0.0f;
+  rightTargetSP          = 0.0f;
+  leftPID.setpoint       = 0.0f;
+  rightPID.setpoint      = 0.0f;
+  leftPID.integral       = 0.0f;
+  rightPID.integral      = 0.0f;
+  leftPWMSlewed          = 0.0f;
+  rightPWMSlewed         = 0.0f;
   applyLeftPWM(0);
   applyRightPWM(0);
   setLeftDir(true);
@@ -226,13 +320,12 @@ void stopMotors() {
 // ─── Differential drive ───────────────────────────────────────────────────────
 
 /**
- * Scale (v, w) uniformly so neither wheel exceeds V_WHEEL_MAX.
- * The v/w ratio is preserved (the robot still curves the same way,
- * just slower).
+ * Uniformly scale (v, w) so neither wheel exceeds V_WHEEL_MAX.
+ * The v/w ratio is preserved so the robot still curves the same way.
  */
 void scaleCmdVel(float v, float w, float& vs, float& ws) {
-  float vL = v - w * HALF_TRACK;
-  float vR = v + w * HALF_TRACK;
+  float vL   = v - w * HALF_TRACK;
+  float vR   = v + w * HALF_TRACK;
   float peak = max(fabsf(vL), fabsf(vR));
   if (peak > V_WHEEL_MAX) {
     float s = V_WHEEL_MAX / peak;
@@ -247,18 +340,38 @@ void scaleCmdVel(float v, float w, float& vs, float& ws) {
 void setCmdVel(float v, float w) {
   float vs, ws;
   scaleCmdVel(v, w, vs, ws);
-
   float vL = vs - ws * HALF_TRACK;
   float vR = vs + ws * HALF_TRACK;
 
-  // Reset integral on direction reversal
-  if ((vL >= 0.0f) != leftFwd)  leftPID.integral  = 0.0f;
-  if ((vR >= 0.0f) != rightFwd) rightPID.integral = 0.0f;
+  // ── Full PID state reset on direction reversal ────────────────────────────
+  // Each field is zeroed for a specific reason:
+  //   integral       – no wind-up from the previous direction carries over
+  //   setpoint       – ramp always starts cleanly from 0 in the new direction
+  //   last_measured  – prevents a large spike in the first derivative update
+  //   filtered_deriv – clears the derivative filter memory
+  //   speed estimate – single-channel encoder cannot verify actual direction;
+  //                    zeroing avoids sign confusion until the motor settles
+  //   slewed PWM     – stops the slew limiter carrying momentum across the flip
+  if ((vL >= 0.0f) != leftFwd) {
+    leftPID.integral       = 0.0f;
+    leftPID.setpoint       = 0.0f;
+    leftPID.last_measured  = 0.0f;
+    leftPID.filtered_deriv = 0.0f;
+    leftSpeed              = 0.0f;
+    leftPWMSlewed          = 0.0f;
+  }
+  if ((vR >= 0.0f) != rightFwd) {
+    rightPID.integral       = 0.0f;
+    rightPID.setpoint       = 0.0f;
+    rightPID.last_measured  = 0.0f;
+    rightPID.filtered_deriv = 0.0f;
+    rightSpeed              = 0.0f;
+    rightPWMSlewed          = 0.0f;
+  }
 
   setLeftDir(vL  >= 0.0f);
   setRightDir(vR >= 0.0f);
 
-  // Store targets; updateSpeeds() ramps the PID setpoints toward these
   leftTargetSP  = vL;
   rightTargetSP = vR;
 
@@ -266,7 +379,7 @@ void setCmdVel(float v, float w) {
   lastCmdVelMS     = millis();
 }
 
-// ─── Speed + odometry update ──────────────────────────────────────────────────
+// ─── Speed + odometry update  (20 Hz) ─────────────────────────────────────────
 void updateSpeeds() {
   unsigned long now = micros();
   if (now - lastSpeedCalcUS < SPEED_CALC_US) return;
@@ -278,8 +391,13 @@ void updateSpeeds() {
 
   float dt = (now - lastSpeedCalcUS) * 1e-6f;
 
-  leftSpeed  = (lp - lastLeftPulses)  * METERS_PER_PULSE / dt;
-  rightSpeed = (rp - lastRightPulses) * METERS_PER_PULSE / dt;
+  // Raw speed from encoder pulse count over the 50 ms window.
+  float rawL = (lp - lastLeftPulses)  * METERS_PER_PULSE / dt;
+  float rawR = (rp - lastRightPulses) * METERS_PER_PULSE / dt;
+
+  // Exponential moving average: α=0.4 → new sample weight 40%, history 60%.
+  leftSpeed  = SPEED_FILTER_ALPHA * rawL + (1.0f - SPEED_FILTER_ALPHA) * leftSpeed;
+  rightSpeed = SPEED_FILTER_ALPHA * rawR + (1.0f - SPEED_FILTER_ALPHA) * rightSpeed;
 
   // Dead-reckoning odometry
   float v = (rightSpeed + leftSpeed) * 0.5f;
@@ -294,37 +412,56 @@ void updateSpeeds() {
   lastRightPulses = rp;
   lastSpeedCalcUS = now;
 
-  // ── Setpoint ramp (acceleration limit) ────────────────────────────────────
-  // Move PID setpoints toward targets by at most MAX_ACCEL_MS2 * dt per cycle.
-  // This prevents jolting when a new CMD_VEL arrives or on startup.
+  // ── Setpoint ramp ─────────────────────────────────────────────────────────
   const float max_step = MAX_ACCEL_MS2 * dt;
-
-  float lErr = leftTargetSP  - leftPID.setpoint;
-  leftPID.setpoint  += constrain(lErr, -max_step, max_step);
-
-  float rErr = rightTargetSP - rightPID.setpoint;
-  rightPID.setpoint += constrain(rErr, -max_step, max_step);
+  leftPID.setpoint  += constrain(leftTargetSP  - leftPID.setpoint,  -max_step, max_step);
+  rightPID.setpoint += constrain(rightTargetSP - rightPID.setpoint, -max_step, max_step);
 }
 
-// ─── Speed control output ─────────────────────────────────────────────────────
+// ─── Speed control  (~1 kHz) ──────────────────────────────────────────────────
 void updateSpeedControl() {
   if (!speedCtrlEnabled) return;
 
-  // Watchdog – stop if host goes silent
   if (millis() - lastCmdVelMS > CMD_TIMEOUT_MS) {
     stopMotors();
     Serial.println("WATCHDOG");
     return;
   }
 
+  unsigned long now = micros();
+  float dt = (now - lastCtrlUS) * 1e-6f;
+  if (dt < 0.001f) return;   // cap at 1 kHz
+  lastCtrlUS = now;
+
+  // PID on filtered speed
   float l_pid = pidUpdate(leftPID,  leftSpeed);
   float r_pid = pidUpdate(rightPID, rightSpeed);
 
-  int l_cmd = constrain((int)roundf(leftFF(leftPID.setpoint)   + l_pid), 0, MAX_PWM);
-  int r_cmd = constrain((int)roundf(rightFF(rightPID.setpoint) + r_pid), 0, MAX_PWM);
+  // ── Sign correction ────────────────────────────────────────────────────────
+  // The PID operates on signed speed; the motor driver only accepts positive
+  // PWM with direction set separately.
+  // For backward motion (setpoint < 0):
+  //   error = setpoint - measured = -sp - (-v) = v - sp
+  //   Motor too slow  → v > sp → error negative → P negative
+  //   Without correction this subtracts from feedforward (wrong).
+  //   Negating restores: "too slow → more PWM" for both directions.
+  if (leftPID.setpoint  < 0.0f) l_pid = -l_pid;
+  if (rightPID.setpoint < 0.0f) r_pid = -r_pid;
 
-  applyLeftPWM(l_cmd);
-  applyRightPWM(r_cmd);
+  // Desired PWM = feedforward (dominant) + PID correction (residual)
+  float l_target = leftFF(leftPID.setpoint)   + l_pid;
+  float r_target = rightFF(rightPID.setpoint) + r_pid;
+
+  // ── PWM slew-rate limiter ──────────────────────────────────────────────────
+  // Caps the rate of change of the actual PWM to PWM_SLEW_RATE units/s.
+  // At 1 kHz: max step = 0.3 PWM/call.  Smooths the startup jump when
+  // feedforward activates and absorbs large sudden PID corrections.
+  float max_slew = PWM_SLEW_RATE * dt;
+  leftPWMSlewed  = constrain(l_target, leftPWMSlewed  - max_slew, leftPWMSlewed  + max_slew);
+  rightPWMSlewed = constrain(r_target, rightPWMSlewed - max_slew, rightPWMSlewed + max_slew);
+
+  applyLeftPWM( constrain((int)roundf(leftPWMSlewed),  0, MAX_PWM));
+  applyRightPWM(constrain((int)roundf(rightPWMSlewed), 0, MAX_PWM));
 }
 
 // ─── Telemetry ────────────────────────────────────────────────────────────────
@@ -359,6 +496,11 @@ bool parsePID(const String& s, float& kp, float& ki, float& kd) {
   ki = s.substring(c1 + 1, c2).toFloat();
   kd = s.substring(c2 + 1).toFloat();
   return true;
+}
+
+// Integral limit sized so the integrator alone cannot saturate the output.
+static inline float integralLimit(float ki, float olim) {
+  return (ki > 0.01f) ? (olim / ki) : 10.0f;
 }
 
 void handleCommand(const String& cmd) {
@@ -401,23 +543,24 @@ void handleCommand(const String& cmd) {
       float v = cmd.substring(8, comma).toFloat();
       float w = cmd.substring(comma + 1).toFloat();
       setCmdVel(v, w);
-      // No verbose ACK – keep command-loop latency minimal
     }
 
   } else if (cmd.startsWith("TUNE:")) {
     float kp, ki, kd;
     if (parsePID(cmd.substring(5), kp, ki, kd)) {
-      pidInit(leftPID,  kp, ki, kd, 100.0f, 30.0f);
-      pidInit(rightPID, kp, ki, kd, 100.0f, 30.0f);
-      Serial.print("PID both Kp=");  Serial.print(kp, 2);
-      Serial.print(" Ki=");           Serial.print(ki, 2);
-      Serial.print(" Kd=");           Serial.println(kd, 2);
+      const float olim = 15.0f;
+      pidInit(leftPID,  kp, ki, kd, integralLimit(ki, olim), olim);
+      pidInit(rightPID, kp, ki, kd, integralLimit(ki, olim), olim);
+      Serial.print("PID both Kp="); Serial.print(kp, 2);
+      Serial.print(" Ki=");          Serial.print(ki, 2);
+      Serial.print(" Kd=");          Serial.println(kd, 2);
     }
 
   } else if (cmd.startsWith("TUNEL:")) {
     float kp, ki, kd;
     if (parsePID(cmd.substring(6), kp, ki, kd)) {
-      pidInit(leftPID, kp, ki, kd, 100.0f, 30.0f);
+      const float olim = 15.0f;
+      pidInit(leftPID, kp, ki, kd, integralLimit(ki, olim), olim);
       Serial.print("PID left Kp="); Serial.print(kp, 2);
       Serial.print(" Ki=");          Serial.print(ki, 2);
       Serial.print(" Kd=");          Serial.println(kd, 2);
@@ -426,7 +569,8 @@ void handleCommand(const String& cmd) {
   } else if (cmd.startsWith("TUNER:")) {
     float kp, ki, kd;
     if (parsePID(cmd.substring(6), kp, ki, kd)) {
-      pidInit(rightPID, kp, ki, kd, 100.0f, 30.0f);
+      const float olim = 15.0f;
+      pidInit(rightPID, kp, ki, kd, integralLimit(ki, olim), olim);
       Serial.print("PID right Kp="); Serial.print(kp, 2);
       Serial.print(" Ki=");           Serial.print(ki, 2);
       Serial.print(" Kd=");           Serial.println(kd, 2);
@@ -455,12 +599,18 @@ void setup() {
   ledcAttachPin(LEFT_PWM,  LEFT_PWM_CH);
   ledcAttachPin(RIGHT_PWM, RIGHT_PWM_CH);
 
-  // Initial PID gains
-  // Left  motor: Ki=2 works well (slight overshoot, corrects quickly)
-  // Right motor: Ki=5 needed — right motor has lower gain (K=0.0127 vs 0.0402)
-  //              and undershot by ~0.02 m/s at 0.2 m/s with Ki=2
-  pidInit(leftPID,  10.0f, 2.0f, 0.1f, 100.0f, 30.0f);
-  pidInit(rightPID, 10.0f, 5.0f, 0.1f, 100.0f, 30.0f);
+  // PID gains  –  output limit ±15, integral limit = output_limit / Ki
+  // Left  Ki=2: integral_limit = 7.5  → I contribution capped at ±15 PWM
+  // Right Ki=5: integral_limit = 3.0  → I contribution capped at ±15 PWM
+  //
+  // Right motor needs higher Ki because its gain (K=0.0127) is much lower
+  // than left (K=0.0402), making it more sensitive to model error and
+  // requiring stronger integral action for the same steady-state accuracy.
+  //
+  // If the robot still curves right after flashing, re-identify the motor
+  // models under load – no-load models may under-predict right motor speed.
+  pidInit(leftPID,  10.0f, 2.0f, 0.1f, 7.5f, 15.0f);
+  pidInit(rightPID, 10.0f, 5.0f, 0.1f, 3.0f, 15.0f);
 
   setLeftDir(true);
   setRightDir(true);
@@ -468,13 +618,13 @@ void setup() {
   applyRightPWM(0);
 
   lastSpeedCalcUS = micros();
+  lastCtrlUS      = micros();
   lastCmdVelMS    = millis();
 
   Serial.println("READY");
-  // Broadcast limits so host knows the operating envelope
-  Serial.print("LIMITS,V_MAX=");  Serial.print(V_MAX,  3);
-  Serial.print(",W_MAX=");         Serial.print(W_MAX,  3);
-  Serial.print(",L=");             Serial.println(WHEEL_SEPARATION_M, 3);
+  Serial.print("LIMITS,V_MAX="); Serial.print(V_MAX,  3);
+  Serial.print(",W_MAX=");        Serial.print(W_MAX,  3);
+  Serial.print(",L=");            Serial.println(WHEEL_SEPARATION_M, 3);
 }
 
 void loop() {
