@@ -188,7 +188,7 @@ class DiffDriveGUI:
 
         motor_rows = [
             ("Left",  (10.0, 2.0, 0.1)),
-            ("Right", (10.0, 2.0, 0.1)),
+            ("Right", (10.0, 5.0, 0.1)),   # higher Ki — right motor undershoots
             ("Both",  (10.0, 2.0, 0.1)),
         ]
         for motor, (kp0, ki0, kd0) in motor_rows:

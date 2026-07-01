@@ -68,6 +68,11 @@
 #define V_MAX        V_WHEEL_MAX        // m/s  linear
 #define W_MAX        (V_WHEEL_MAX / HALF_TRACK)  // rad/s  ≈ 2.49
 
+// ─── Acceleration limit ──────────────────────────────────────────────────────
+// Ramp setpoints at this rate to prevent jolt on startup / step changes.
+// 0.4 m/s²  → reaches 0.4 m/s in 1 s;  step per 50 ms cycle = 0.02 m/s
+#define MAX_ACCEL_MS2  0.4f
+
 // ─── Timing ───────────────────────────────────────────────────────────────────
 #define SPEED_CALC_US    50000UL   // 50 ms → 20 Hz speed update
 #define ODOM_STREAM_MS   50UL      // 50 ms → 20 Hz telemetry
@@ -118,6 +123,10 @@ float odomW   = 0.0f;
 
 PIDController leftPID;
 PIDController rightPID;
+
+// Commanded targets — PID setpoints ramp toward these each speed cycle
+float leftTargetSP  = 0.0f;
+float rightTargetSP = 0.0f;
 
 bool          streaming        = false;
 bool          speedCtrlEnabled = false;
@@ -202,6 +211,8 @@ void applyRightPWM(int pwm) {
 
 void stopMotors() {
   speedCtrlEnabled    = false;
+  leftTargetSP        = 0.0f;
+  rightTargetSP       = 0.0f;
   leftPID.setpoint    = 0.0f;
   rightPID.setpoint   = 0.0f;
   leftPID.integral    = 0.0f;
@@ -240,15 +251,16 @@ void setCmdVel(float v, float w) {
   float vL = vs - ws * HALF_TRACK;
   float vR = vs + ws * HALF_TRACK;
 
-  // Reset integral only on direction reversal to prevent windup during flip
+  // Reset integral on direction reversal
   if ((vL >= 0.0f) != leftFwd)  leftPID.integral  = 0.0f;
   if ((vR >= 0.0f) != rightFwd) rightPID.integral = 0.0f;
 
   setLeftDir(vL  >= 0.0f);
   setRightDir(vR >= 0.0f);
 
-  leftPID.setpoint  = vL;
-  rightPID.setpoint = vR;
+  // Store targets; updateSpeeds() ramps the PID setpoints toward these
+  leftTargetSP  = vL;
+  rightTargetSP = vR;
 
   speedCtrlEnabled = true;
   lastCmdVelMS     = millis();
@@ -281,6 +293,17 @@ void updateSpeeds() {
   lastLeftPulses  = lp;
   lastRightPulses = rp;
   lastSpeedCalcUS = now;
+
+  // ── Setpoint ramp (acceleration limit) ────────────────────────────────────
+  // Move PID setpoints toward targets by at most MAX_ACCEL_MS2 * dt per cycle.
+  // This prevents jolting when a new CMD_VEL arrives or on startup.
+  const float max_step = MAX_ACCEL_MS2 * dt;
+
+  float lErr = leftTargetSP  - leftPID.setpoint;
+  leftPID.setpoint  += constrain(lErr, -max_step, max_step);
+
+  float rErr = rightTargetSP - rightPID.setpoint;
+  rightPID.setpoint += constrain(rErr, -max_step, max_step);
 }
 
 // ─── Speed control output ─────────────────────────────────────────────────────
@@ -432,9 +455,12 @@ void setup() {
   ledcAttachPin(LEFT_PWM,  LEFT_PWM_CH);
   ledcAttachPin(RIGHT_PWM, RIGHT_PWM_CH);
 
-  // Initial PID gains (same as tuned speed_control.ino values)
+  // Initial PID gains
+  // Left  motor: Ki=2 works well (slight overshoot, corrects quickly)
+  // Right motor: Ki=5 needed — right motor has lower gain (K=0.0127 vs 0.0402)
+  //              and undershot by ~0.02 m/s at 0.2 m/s with Ki=2
   pidInit(leftPID,  10.0f, 2.0f, 0.1f, 100.0f, 30.0f);
-  pidInit(rightPID, 10.0f, 2.0f, 0.1f, 100.0f, 30.0f);
+  pidInit(rightPID, 10.0f, 5.0f, 0.1f, 100.0f, 30.0f);
 
   setLeftDir(true);
   setRightDir(true);
