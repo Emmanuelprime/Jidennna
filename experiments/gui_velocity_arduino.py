@@ -4,7 +4,6 @@ import serial
 import serial.tools.list_ports
 import threading
 import time
-import re
 import sys
 import os
 from datetime import datetime
@@ -52,7 +51,11 @@ class RobotGUI:
         
         # Connection monitoring
         self.last_data_time = time.time()
-        self.connection_timeout = 5.0  # seconds
+        self.connection_timeout = 10.0  # Increased timeout
+        self.ping_interval = 2.0
+        self.last_ping_time = time.time()
+        self.ping_retries = 0
+        self.max_ping_retries = 3
         
         # Create GUI
         self.create_widgets()
@@ -98,6 +101,10 @@ class RobotGUI:
         self.status_label = ttk.Label(conn_frame, text="Disconnected", foreground="red")
         self.status_label.grid(row=0, column=6, padx=10)
         
+        # Debug button
+        self.debug_btn = ttk.Button(conn_frame, text="Debug", command=self.debug_connection)
+        self.debug_btn.grid(row=0, column=7, padx=5)
+        
         # Control Frame
         ctrl_frame = ttk.LabelFrame(main_frame, text="Motion Control", padding="10")
         ctrl_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
@@ -119,11 +126,10 @@ class RobotGUI:
             ttk.Button(speed_btn_frame, text=f"{speed:.1f}", width=5,
                       command=lambda s=speed: self.set_speed(s)).pack(side=tk.LEFT, padx=2)
         
-        # Direction buttons - Using simple text to avoid X11 rendering issues
+        # Direction buttons
         btn_frame = ttk.Frame(ctrl_frame)
         btn_frame.grid(row=2, column=0, columnspan=3, pady=10)
         
-        # Use simple text buttons instead of Unicode arrows
         ttk.Button(btn_frame, text="Forward", command=lambda: self.send_command('F'), 
                   width=10).grid(row=0, column=0, padx=5)
         ttk.Button(btn_frame, text="Reverse", command=lambda: self.send_command('R'), 
@@ -257,13 +263,32 @@ class RobotGUI:
                 # On Linux, we might need to wait for the port to be ready
                 time.sleep(0.1)
             
-            self.serial_port = serial.Serial(port, baud, timeout=0.1)
+            # Open serial port with more robust settings
+            self.serial_port = serial.Serial(
+                port=port,
+                baudrate=baud,
+                timeout=1.0,  # Longer timeout for better reading
+                write_timeout=1.0,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False
+            )
             
             # Wait for connection to stabilize
-            time.sleep(0.5)
+            time.sleep(2.0)  # Increased wait time
+            
+            # Clear any pending data
+            self.serial_port.reset_input_buffer()
+            self.serial_port.reset_output_buffer()
             
             self.is_connected = True
             self.reconnect_attempts = 0
+            self.ping_retries = 0
+            self.last_data_time = time.time()
+            self.last_ping_time = time.time()
             self.connect_btn.configure(text="Disconnect")
             self.status_label.configure(text="Connected", foreground="green")
             
@@ -272,7 +297,8 @@ class RobotGUI:
             self.reading_thread = threading.Thread(target=self.read_serial, daemon=True)
             self.reading_thread.start()
             
-            # Send PING to check connection
+            # Send initial PING to check connection
+            time.sleep(0.5)
             self.send_command("PING")
             
             self.log_console(f"Connected to {port} at {baud} baud")
@@ -281,26 +307,56 @@ class RobotGUI:
             error_msg = str(e)
             if "Access denied" in error_msg or "Permission denied" in error_msg:
                 self.log_console(f"Permission denied. On Linux/Jetson, try: sudo chmod 666 {port}")
+                self.log_console(f"Or add user to dialout group: sudo usermod -a -G dialout $USER")
             else:
                 self.log_console(f"Connection error: {error_msg}")
             self.status_label.configure(text="Error", foreground="red")
+            self.is_connected = False
             
         except Exception as e:
             self.log_console(f"Connection error: {str(e)}")
             self.status_label.configure(text="Error", foreground="red")
+            self.is_connected = False
     
     def disconnect(self):
         self.running = False
         if self.reading_thread:
-            self.reading_thread.join(timeout=1)
+            self.reading_thread.join(timeout=2)
         
         if self.serial_port and self.serial_port.is_open:
-            self.serial_port.close()
+            try:
+                self.serial_port.close()
+            except:
+                pass
         
         self.is_connected = False
         self.connect_btn.configure(text="Connect")
         self.status_label.configure(text="Disconnected", foreground="red")
         self.log_console("Disconnected")
+    
+    def debug_connection(self):
+        """Debug function to test serial connection"""
+        if not self.is_connected:
+            self.log_console("Not connected - click Connect first")
+            return
+            
+        self.log_console("=== DEBUG INFO ===")
+        self.log_console(f"Connected: {self.is_connected}")
+        self.log_console(f"Port: {self.serial_port.port if self.serial_port else 'None'}")
+        self.log_console(f"Baudrate: {self.serial_port.baudrate if self.serial_port else 'None'}")
+        self.log_console(f"Port open: {self.serial_port.is_open if self.serial_port else 'False'}")
+        self.log_console(f"In waiting: {self.serial_port.in_waiting if self.serial_port else 0}")
+        
+        # Try to send a PING manually
+        self.send_command("PING")
+        time.sleep(0.5)
+        
+        # Check if any data was received
+        if self.serial_port and self.serial_port.in_waiting > 0:
+            data = self.serial_port.read(self.serial_port.in_waiting)
+            self.log_console(f"Data received: {data}")
+        else:
+            self.log_console("No data received - check Arduino connection and firmware")
     
     def send_command(self, cmd):
         if not self.is_connected or not self.serial_port:
@@ -318,9 +374,9 @@ class RobotGUI:
                 full_cmd = f"{cmd}\n"
             
             # Ensure the command is sent properly
-            self.serial_port.write(full_cmd.encode())
+            bytes_written = self.serial_port.write(full_cmd.encode())
             self.serial_port.flush()
-            self.log_console(f"Sent: {full_cmd.strip()}")
+            self.log_console(f"Sent ({bytes_written} bytes): {full_cmd.strip()}")
             
         except serial.SerialException as e:
             self.log_console(f"Send error - connection lost: {str(e)}")
@@ -337,11 +393,15 @@ class RobotGUI:
     
     def read_serial(self):
         buffer = ""
+        last_read_time = time.time()
+        
         while self.running:
             try:
-                if self.serial_port and self.serial_port.in_waiting:
+                if self.serial_port and self.serial_port.in_waiting > 0:
+                    # Read available data
                     data = self.serial_port.read(self.serial_port.in_waiting)
                     buffer += data.decode('utf-8', errors='ignore')
+                    last_read_time = time.time()
                     
                     # Process complete lines
                     lines = buffer.split('\n')
@@ -352,15 +412,29 @@ class RobotGUI:
                         if line:
                             self.process_serial_line(line)
                             self.last_data_time = time.time()
-                            
-                # Check for timeout
-                elif self.is_connected and time.time() - self.last_data_time > self.connection_timeout:
-                    self.log_console("Connection timeout - no data received")
-                    self.running = False
-                    self.root.after(0, self.disconnect)
-                    break
+                
+                # Check for timeout - only if we haven't received data for a while
+                elif self.is_connected and time.time() - last_read_time > 5.0:
+                    # Send a ping to check connection
+                    if time.time() - self.last_ping_time > self.ping_interval:
+                        self.last_ping_time = time.time()
+                        self.send_command("PING")
+                        self.ping_retries += 1
+                        
+                        if self.ping_retries > self.max_ping_retries:
+                            self.log_console("Max ping retries exceeded - connection lost")
+                            self.running = False
+                            self.root.after(0, self.disconnect)
+                            break
                     
-                time.sleep(0.01)
+                    # Check for overall connection timeout
+                    if time.time() - self.last_data_time > self.connection_timeout:
+                        self.log_console("Connection timeout - no data received")
+                        self.running = False
+                        self.root.after(0, self.disconnect)
+                        break
+                
+                time.sleep(0.05)  # Small delay to prevent CPU hogging
                 
             except serial.SerialException as e:
                 if self.running:
@@ -380,6 +454,9 @@ class RobotGUI:
         # Log to console (except telemetry data)
         if not line.startswith('CNT,'):
             self.log_console(f"< {line}")
+            
+            # Reset ping retries on any response
+            self.ping_retries = 0
         
         # Parse telemetry data
         if line.startswith('CNT,'):
@@ -403,6 +480,7 @@ class RobotGUI:
         # Check for READY response
         if line == "READY":
             self.log_console("Robot ready - communication established")
+            self.ping_retries = 0
     
     def update_telemetry(self):
         self.telemetry_vars['left_speed'].set(f"{self.left_speed:.3f}")
@@ -425,10 +503,11 @@ class RobotGUI:
     
     def monitor_connection(self):
         """Periodically check connection health"""
-        if self.is_connected:
-            # Send a ping every few seconds to keep connection alive
-            if time.time() - self.last_data_time > 2.0:
-                self.send_command("PING")
+        if self.is_connected and self.serial_port:
+            # Check if port is still open
+            if not self.serial_port.is_open:
+                self.log_console("Serial port closed unexpectedly")
+                self.root.after(0, self.disconnect)
         
         # Schedule next check
         self.root.after(3000, self.monitor_connection)
@@ -440,20 +519,15 @@ class RobotGUI:
 
 if __name__ == "__main__":
     # Set up for better cross-platform compatibility
-    if sys.platform.startswith('linux'):
-        # On Linux, we might need to run with sudo for serial access
-        try:
-            root = tk.Tk()
-            app = RobotGUI(root)
-            root.protocol("WM_DELETE_WINDOW", app.on_closing)
-            root.mainloop()
-        except Exception as e:
-            print(f"Error: {e}")
-            print("On Linux/Jetson, you may need to:")
-            print("  sudo chmod 666 /dev/ttyUSB*")
-            print("  or add your user to the dialout group: sudo usermod -a -G dialout $USER")
-    else:
+    try:
         root = tk.Tk()
         app = RobotGUI(root)
         root.protocol("WM_DELETE_WINDOW", app.on_closing)
         root.mainloop()
+    except Exception as e:
+        print(f"Error: {e}")
+        if sys.platform.startswith('linux'):
+            print("On Linux/Jetson, you may need to:")
+            print("  sudo chmod 666 /dev/ttyUSB*")
+            print("  or add your user to the dialout group: sudo usermod -a -G dialout $USER")
+            print("  Also check if Arduino is connected and running the firmware")
