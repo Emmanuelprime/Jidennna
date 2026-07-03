@@ -6,13 +6,14 @@ import threading
 import time
 import sys
 import os
+import math
 from datetime import datetime
 
 class RobotGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Robot Control Panel - Cross Platform")
-        self.root.geometry("900x700")
+        self.root.title("Robot Control Panel - IMU Enhanced")
+        self.root.geometry("1000x800")
         
         # Detect platform
         self.is_windows = sys.platform.startswith('win')
@@ -48,14 +49,21 @@ class RobotGUI:
         self.right_pwm = 0
         self.actual_linear = 0.0
         self.actual_omega = 0.0
+        self.actual_omega_imu = 0.0
+        self.yaw = 0.0
         
         # Connection monitoring
         self.last_data_time = time.time()
-        self.connection_timeout = 10.0  # Increased timeout
+        self.connection_timeout = 10.0
         self.ping_interval = 2.0
         self.last_ping_time = time.time()
         self.ping_retries = 0
         self.max_ping_retries = 3
+        
+        # Arc turn mode
+        self.arc_mode = False
+        self.arc_linear = 0.0
+        self.arc_angular = 0.0
         
         # Create GUI
         self.create_widgets()
@@ -73,7 +81,8 @@ class RobotGUI:
         
         # Platform info
         platform_text = "Jetson Nano" if self.is_jetson else ("Windows" if self.is_windows else "Linux")
-        ttk.Label(main_frame, text=f"Platform: {platform_text}", font=('Arial', 10, 'bold')).grid(
+        ttk.Label(main_frame, text=f"Platform: {platform_text} | IMU-Enhanced Robot", 
+                 font=('Arial', 10, 'bold')).grid(
             row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 5))
         
         # Connection Frame
@@ -126,7 +135,7 @@ class RobotGUI:
             ttk.Button(speed_btn_frame, text=f"{speed:.1f}", width=5,
                       command=lambda s=speed: self.set_speed(s)).pack(side=tk.LEFT, padx=2)
         
-        # Direction buttons
+        # Direction buttons with IMU support
         btn_frame = ttk.Frame(ctrl_frame)
         btn_frame.grid(row=2, column=0, columnspan=3, pady=10)
         
@@ -140,50 +149,62 @@ class RobotGUI:
                   width=10).grid(row=0, column=3, padx=5)
         ttk.Button(btn_frame, text="Stop", command=lambda: self.send_command('s'), 
                   width=10).grid(row=0, column=4, padx=5)
-        ttk.Button(btn_frame, text="Zero", command=lambda: self.send_command('z'), 
-                  width=10).grid(row=0, column=5, padx=5)
+        
+        # Special buttons
+        special_btn_frame = ttk.Frame(ctrl_frame)
+        special_btn_frame.grid(row=3, column=0, columnspan=3, pady=5)
+        
+        ttk.Button(special_btn_frame, text="Zero Encoders", command=lambda: self.send_command('z'), 
+                  width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(special_btn_frame, text="Calibrate IMU", command=lambda: self.send_command('C'), 
+                  width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(special_btn_frame, text="Arc Turn", command=self.open_arc_window, 
+                  width=12).pack(side=tk.LEFT, padx=2)
         
         # Spin speed control
-        ttk.Label(ctrl_frame, text="Spin Speed (rad/s):").grid(row=3, column=0, padx=5, pady=5)
+        ttk.Label(ctrl_frame, text="Spin Speed (rad/s):").grid(row=4, column=0, padx=5, pady=5)
         self.omega_var = tk.DoubleVar(value=1.0)
         omega_scale = ttk.Scale(ctrl_frame, from_=0.0, to=2.0, variable=self.omega_var, 
                                orient=tk.HORIZONTAL, length=200)
-        omega_scale.grid(row=3, column=1, padx=5, pady=5)
+        omega_scale.grid(row=4, column=1, padx=5, pady=5)
         self.omega_label = ttk.Label(ctrl_frame, text="1.00", width=6)
-        self.omega_label.grid(row=3, column=2, padx=5)
+        self.omega_label.grid(row=4, column=2, padx=5)
         omega_scale.configure(command=lambda x: self.omega_label.configure(text=f"{float(x):.2f}"))
         
         # Manual command input
-        ttk.Label(ctrl_frame, text="Manual Command:").grid(row=4, column=0, padx=5, pady=5)
-        self.cmd_entry = ttk.Entry(ctrl_frame, width=20)
-        self.cmd_entry.grid(row=4, column=1, padx=5, pady=5)
-        ttk.Button(ctrl_frame, text="Send", command=self.send_manual_command).grid(row=4, column=2, padx=5)
+        ttk.Label(ctrl_frame, text="Manual Command:").grid(row=5, column=0, padx=5, pady=5)
+        self.cmd_entry = ttk.Entry(ctrl_frame, width=25)
+        self.cmd_entry.grid(row=5, column=1, padx=5, pady=5)
+        ttk.Button(ctrl_frame, text="Send", command=self.send_manual_command).grid(row=5, column=2, padx=5)
+        ttk.Label(ctrl_frame, text="(F/R/L/B/s/z/C/Vx,y)").grid(row=6, column=0, columnspan=3, pady=2)
         
         # Status Frame (Right side)
         status_frame = ttk.LabelFrame(main_frame, text="Robot Status", padding="10")
         status_frame.grid(row=2, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10), padx=(10, 0))
         
-        self.status_text = scrolledtext.ScrolledText(status_frame, width=40, height=12, font=('Courier', 9))
+        self.status_text = scrolledtext.ScrolledText(status_frame, width=40, height=15, font=('Courier', 9))
         self.status_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Telemetry Frame
         telemetry_frame = ttk.LabelFrame(main_frame, text="Telemetry", padding="10")
         telemetry_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
-        # Create telemetry grid
+        # Create telemetry grid with IMU data
         telemetry_labels = [
             ("Left Speed (m/s):", "left_speed", "0.000"),
             ("Right Speed (m/s):", "right_speed", "0.000"),
             ("Left PWM:", "left_pwm", "0"),
             ("Right PWM:", "right_pwm", "0"),
             ("Actual Linear (m/s):", "actual_linear", "0.000"),
-            ("Actual Omega (rad/s):", "actual_omega", "0.000")
+            ("Actual Omega (enc):", "actual_omega", "0.000"),
+            ("IMU Omega (rad/s):", "imu_omega", "0.000"),
+            ("Yaw (deg):", "yaw", "0.0")
         ]
         
         self.telemetry_vars = {}
         for i, (label, key, default) in enumerate(telemetry_labels):
-            row = i // 3
-            col = (i % 3) * 2
+            row = i // 4
+            col = (i % 4) * 2
             ttk.Label(telemetry_frame, text=label).grid(row=row, column=col, padx=5, pady=2, sticky=tk.E)
             var = tk.StringVar(value=default)
             self.telemetry_vars[key] = var
@@ -204,6 +225,48 @@ class RobotGUI:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         
+    def open_arc_window(self):
+        """Open window for arc turn control"""
+        arc_window = tk.Toplevel(self.root)
+        arc_window.title("Arc Turn Control")
+        arc_window.geometry("400x250")
+        arc_window.transient(self.root)
+        arc_window.grab_set()
+        
+        # Linear velocity
+        ttk.Label(arc_window, text="Linear Velocity (m/s):").grid(row=0, column=0, padx=10, pady=10)
+        linear_var = tk.DoubleVar(value=0.5)
+        linear_scale = ttk.Scale(arc_window, from_=-1.2, to=1.2, variable=linear_var,
+                               orient=tk.HORIZONTAL, length=250)
+        linear_scale.grid(row=0, column=1, padx=10, pady=10)
+        linear_label = ttk.Label(arc_window, text="0.50", width=6)
+        linear_label.grid(row=0, column=2, padx=5)
+        linear_scale.configure(command=lambda x: linear_label.configure(text=f"{float(x):.2f}"))
+        
+        # Angular velocity
+        ttk.Label(arc_window, text="Angular Velocity (rad/s):").grid(row=1, column=0, padx=10, pady=10)
+        angular_var = tk.DoubleVar(value=0.5)
+        angular_scale = ttk.Scale(arc_window, from_=-2.0, to=2.0, variable=angular_var,
+                                orient=tk.HORIZONTAL, length=250)
+        angular_scale.grid(row=1, column=1, padx=10, pady=10)
+        angular_label = ttk.Label(arc_window, text="0.50", width=6)
+        angular_label.grid(row=1, column=2, padx=5)
+        angular_scale.configure(command=lambda x: angular_label.configure(text=f"{float(x):.2f}"))
+        
+        def send_arc():
+            v = linear_var.get()
+            w = angular_var.get()
+            cmd = f"V{v:.3f},{w:.3f}"
+            self.send_command(cmd)
+            arc_window.destroy()
+        
+        def stop_arc():
+            self.send_command('s')
+            arc_window.destroy()
+        
+        ttk.Button(arc_window, text="Execute Arc", command=send_arc, width=15).grid(row=2, column=0, padx=10, pady=20)
+        ttk.Button(arc_window, text="Cancel (Stop)", command=stop_arc, width=15).grid(row=2, column=1, padx=10, pady=20)
+        
     def set_speed(self, speed):
         """Set the speed slider to a specific value"""
         self.speed_var.set(speed)
@@ -213,10 +276,8 @@ class RobotGUI:
         """Refresh the list of available serial ports"""
         ports = []
         try:
-            # Get all available ports
             available_ports = [port.device for port in serial.tools.list_ports.comports()]
             
-            # On Jetson/Linux, also check for common USB devices
             if self.is_linux:
                 import glob
                 usb_ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
@@ -226,13 +287,11 @@ class RobotGUI:
             
             ports = available_ports
             
-            # If no ports found, use default list
             if not ports:
                 ports = self.default_ports
             
             self.port_combo['values'] = ports
             
-            # Try to select the first available port or keep current selection
             if self.port_var.get() in ports:
                 self.port_combo.set(self.port_var.get())
             elif ports:
@@ -240,7 +299,6 @@ class RobotGUI:
                 
         except Exception as e:
             self.log_console(f"Error refreshing ports: {str(e)}")
-            # Fallback to default ports
             self.port_combo['values'] = self.default_ports
             if self.default_ports:
                 self.port_combo.set(self.default_ports[0])
@@ -258,16 +316,13 @@ class RobotGUI:
             
             self.log_console(f"Attempting to connect to {port} at {baud} baud...")
             
-            # Platform-specific connection settings
             if self.is_linux:
-                # On Linux, we might need to wait for the port to be ready
                 time.sleep(0.1)
             
-            # Open serial port with more robust settings
             self.serial_port = serial.Serial(
                 port=port,
                 baudrate=baud,
-                timeout=1.0,  # Longer timeout for better reading
+                timeout=1.0,
                 write_timeout=1.0,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
@@ -277,10 +332,8 @@ class RobotGUI:
                 dsrdtr=False
             )
             
-            # Wait for connection to stabilize
-            time.sleep(2.0)  # Increased wait time
+            time.sleep(2.0)
             
-            # Clear any pending data
             self.serial_port.reset_input_buffer()
             self.serial_port.reset_output_buffer()
             
@@ -292,12 +345,10 @@ class RobotGUI:
             self.connect_btn.configure(text="Disconnect")
             self.status_label.configure(text="Connected", foreground="green")
             
-            # Start reading thread
             self.running = True
             self.reading_thread = threading.Thread(target=self.read_serial, daemon=True)
             self.reading_thread.start()
             
-            # Send initial PING to check connection
             time.sleep(0.5)
             self.send_command("PING")
             
@@ -347,11 +398,9 @@ class RobotGUI:
         self.log_console(f"Port open: {self.serial_port.is_open if self.serial_port else 'False'}")
         self.log_console(f"In waiting: {self.serial_port.in_waiting if self.serial_port else 0}")
         
-        # Try to send a PING manually
         self.send_command("PING")
         time.sleep(0.5)
         
-        # Check if any data was received
         if self.serial_port and self.serial_port.in_waiting > 0:
             data = self.serial_port.read(self.serial_port.in_waiting)
             self.log_console(f"Data received: {data}")
@@ -364,16 +413,19 @@ class RobotGUI:
             return
         
         try:
+            # Handle different command types
             if cmd in ['F', 'R']:
                 speed = self.speed_var.get()
                 full_cmd = f"{cmd}{speed:.3f}\n"
             elif cmd in ['L', 'B']:
                 omega = self.omega_var.get()
                 full_cmd = f"{cmd}{omega:.3f}\n"
+            elif cmd.startswith('V'):
+                # Arc turn command - already formatted
+                full_cmd = f"{cmd}\n"
             else:
                 full_cmd = f"{cmd}\n"
             
-            # Ensure the command is sent properly
             bytes_written = self.serial_port.write(full_cmd.encode())
             self.serial_port.flush()
             self.log_console(f"Sent ({bytes_written} bytes): {full_cmd.strip()}")
@@ -398,14 +450,12 @@ class RobotGUI:
         while self.running:
             try:
                 if self.serial_port and self.serial_port.in_waiting > 0:
-                    # Read available data
                     data = self.serial_port.read(self.serial_port.in_waiting)
                     buffer += data.decode('utf-8', errors='ignore')
                     last_read_time = time.time()
                     
-                    # Process complete lines
                     lines = buffer.split('\n')
-                    buffer = lines[-1]  # Keep incomplete line
+                    buffer = lines[-1]
                     
                     for line in lines[:-1]:
                         line = line.strip()
@@ -413,9 +463,7 @@ class RobotGUI:
                             self.process_serial_line(line)
                             self.last_data_time = time.time()
                 
-                # Check for timeout - only if we haven't received data for a while
                 elif self.is_connected and time.time() - last_read_time > 5.0:
-                    # Send a ping to check connection
                     if time.time() - self.last_ping_time > self.ping_interval:
                         self.last_ping_time = time.time()
                         self.send_command("PING")
@@ -427,14 +475,13 @@ class RobotGUI:
                             self.root.after(0, self.disconnect)
                             break
                     
-                    # Check for overall connection timeout
                     if time.time() - self.last_data_time > self.connection_timeout:
                         self.log_console("Connection timeout - no data received")
                         self.running = False
                         self.root.after(0, self.disconnect)
                         break
                 
-                time.sleep(0.05)  # Small delay to prevent CPU hogging
+                time.sleep(0.05)
                 
             except serial.SerialException as e:
                 if self.running:
@@ -454,22 +501,22 @@ class RobotGUI:
         # Log to console (except telemetry data)
         if not line.startswith('CNT,'):
             self.log_console(f"< {line}")
-            
-            # Reset ping retries on any response
             self.ping_retries = 0
         
-        # Parse telemetry data
+        # Parse telemetry data - Updated format for new firmware
         if line.startswith('CNT,'):
             try:
                 parts = line.split(',')
-                if len(parts) >= 8:
-                    # CNT,time,vL,vR,linear,omega,leftPWM,rightPWM
+                if len(parts) >= 10:
+                    # CNT,time,vL,vR,linear,omega,actualOmega,yaw,leftPWM,rightPWM
                     self.left_speed = float(parts[2])
                     self.right_speed = float(parts[3])
                     self.actual_linear = float(parts[4])
                     self.actual_omega = float(parts[5])
-                    self.left_pwm = int(parts[6])
-                    self.right_pwm = int(parts[7])
+                    self.actual_omega_imu = float(parts[6])
+                    self.yaw = float(parts[7])
+                    self.left_pwm = int(parts[8])
+                    self.right_pwm = int(parts[9])
                     
                     # Update telemetry display
                     self.root.after(0, self.update_telemetry)
@@ -481,6 +528,10 @@ class RobotGUI:
         if line == "READY":
             self.log_console("Robot ready - communication established")
             self.ping_retries = 0
+        
+        # Check for calibration messages
+        if "IMU Calibrated" in line:
+            self.log_console("IMU calibration completed successfully!")
     
     def update_telemetry(self):
         self.telemetry_vars['left_speed'].set(f"{self.left_speed:.3f}")
@@ -489,6 +540,8 @@ class RobotGUI:
         self.telemetry_vars['right_pwm'].set(f"{self.right_pwm}")
         self.telemetry_vars['actual_linear'].set(f"{self.actual_linear:.3f}")
         self.telemetry_vars['actual_omega'].set(f"{self.actual_omega:.3f}")
+        self.telemetry_vars['imu_omega'].set(f"{self.actual_omega_imu:.3f}")
+        self.telemetry_vars['yaw'].set(f"{self.yaw:.1f}")
     
     def log_console(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -497,19 +550,16 @@ class RobotGUI:
     def _append_console(self, message):
         self.console_text.insert(tk.END, message)
         self.console_text.see(tk.END)
-        # Limit console size to prevent memory issues
         if int(self.console_text.index('end-1c').split('.')[0]) > 1000:
             self.console_text.delete('1.0', '2.0')
     
     def monitor_connection(self):
         """Periodically check connection health"""
         if self.is_connected and self.serial_port:
-            # Check if port is still open
             if not self.serial_port.is_open:
                 self.log_console("Serial port closed unexpectedly")
                 self.root.after(0, self.disconnect)
         
-        # Schedule next check
         self.root.after(3000, self.monitor_connection)
     
     def on_closing(self):
@@ -518,7 +568,6 @@ class RobotGUI:
         self.root.destroy()
 
 if __name__ == "__main__":
-    # Set up for better cross-platform compatibility
     try:
         root = tk.Tk()
         app = RobotGUI(root)
@@ -529,5 +578,4 @@ if __name__ == "__main__":
         if sys.platform.startswith('linux'):
             print("On Linux/Jetson, you may need to:")
             print("  sudo chmod 666 /dev/ttyUSB*")
-            print("  or add your user to the dialout group: sudo usermod -a -G dialout $USER")
-            print("  Also check if Arduino is connected and running the firmware")
+            print("  or add user to dialout group: sudo usermod -a -G dialout $USER")
