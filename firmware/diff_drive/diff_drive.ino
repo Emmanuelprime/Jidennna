@@ -118,20 +118,40 @@
 // PWM slew: 300 PWM/s at 1 kHz → 0.3 PWM/ms → 0 to 60 in 200 ms.
 #define PWM_SLEW_RATE       300.0f
 
-// Speed EMA: α=0.4 → time constant ≈ 75 ms.
-#define SPEED_FILTER_ALPHA  0.4f
+// Dead zone minimum PWM: the minimum PWM that produces measurable wheel motion.
+// Below this threshold the motor stalls.  When motion is commanded, the output
+// is clamped to this minimum so the PID can never drive the motor into its dead
+// zone and cause limit cycle oscillation (move-stop-move-stop).
+// Values from the identified motor models (v = 0 when PWM ≤ dead zone boundary):
+//   Left:  v = 0.0402*PWM - 0.3415 = 0  →  PWM = 8.5  →  use 9
+//   Right: v = 0.0127*PWM + 0.0059 = 0  →  PWM < 0    →  no dead zone, use 2
+#define LEFT_MIN_PWM   9
+#define RIGHT_MIN_PWM  2
+
+// Speed EMA: α=0.5 with the 200 ms window (raw estimates are already
+// smoother; less aggressive filtering still gives τ ≈ 200 ms).
+#define SPEED_FILTER_ALPHA  0.5f
 
 // Derivative EMA: α=0.3 → stronger noise suppression on the D term.
 #define DERIV_FILTER_ALPHA  0.3f
 
 // ─── Timing ───────────────────────────────────────────────────────────────────
-#define SPEED_CALC_US    50000UL   // 50 ms → 20 Hz speed update
-#define ODOM_STREAM_MS   50UL      // 50 ms → 20 Hz telemetry
-#define CMD_TIMEOUT_MS   500UL     // watchdog: stop if no CMD_VEL for 500 ms
+// SPEED_CALC_US is intentionally long (200 ms) to accumulate enough encoder
+// pulses for accurate speed estimation at low speeds.
+//
+// At 0.09 m/s (spin case): 0.09/0.00576 * 0.05 = 0.8 pulses per 50 ms → the
+// measurement alternates between 0 and 0.115 m/s → PID oscillates (jerk).
+// At 200 ms:               0.09/0.00576 * 0.20 = 3.1 pulses → stable reading.
+//
+// The setpoint ramp runs on a SEPARATE 50 ms timer so it is not slowed down.
+#define SPEED_CALC_US    200000UL  // 200 ms → 5 Hz speed update
+#define RAMP_UPDATE_US    50000UL  // 50 ms  → 20 Hz setpoint ramp
+#define ODOM_STREAM_MS   50UL      // 50 ms  → 20 Hz telemetry
+#define CMD_TIMEOUT_MS   500UL     // watchdog
 #define CTRL_MIN_US      1000UL    // control loop floor: 1 kHz
 
 // ─── Encoder debounce ────────────────────────────────────────────────────────
-#define DEBOUNCE_US  1000UL
+#define DEBOUNCE_US  2000UL
 
 // ─── Direction polarity ───────────────────────────────────────────────────────
 #define LEFT_FORWARD   HIGH
@@ -185,11 +205,13 @@ float rightTargetSP = 0.0f;
 float leftPWMSlewed  = 0.0f;
 float rightPWMSlewed = 0.0f;
 
-bool          streaming        = false;
-bool          speedCtrlEnabled = false;
-unsigned long lastStreamMS     = 0;
-unsigned long lastCmdVelMS     = 0;
-unsigned long lastCtrlUS       = 0;   // control-loop dt tracking
+bool          streaming              = false;
+bool          speedCtrlEnabled       = false;
+bool          speedUpdatedThisCycle  = false;  // set by updateSpeeds(), consumed by updateSpeedControl()
+unsigned long lastStreamMS           = 0;
+unsigned long lastCmdVelMS           = 0;
+unsigned long lastCtrlUS             = 0;
+unsigned long lastRampUS             = 0;
 
 // ─── ISRs ─────────────────────────────────────────────────────────────────────
 void IRAM_ATTR leftISR() {
@@ -271,13 +293,22 @@ float pidUpdate(PIDController& pid, float measured) {
 // fabsf(v): direction is handled by the direction pin; FF computes the
 // PWM magnitude only.  Threshold 0.05 m/s keeps the motor off below the
 // model's dead-zone (~PWM 8-9 for the left motor).
+//
+// RIGHT_FF_LOAD_FACTOR compensates for the right motor running slower under
+// the robot's weight than the no-load model predicts.  The no-load model
+// (K=0.0127) underestimates the PWM needed under load because the right
+// motor has lower torque (3x lower gain than left).  Start at 1.25 and
+// tune upward until the robot drives straight at v=0.2, w=0.  You can
+// adjust this live via  TUNER:kp,ki,kd  or re-identify the model under load.
+#define RIGHT_FF_LOAD_FACTOR  1.25f
+
 inline float leftFF(float v) {
   float s = fabsf(v);
   return (s > 0.05f) ? (s + 0.3415f) / 0.0402f : 0.0f;
 }
 inline float rightFF(float v) {
   float s = fabsf(v);
-  return (s > 0.05f) ? (s - 0.0059f) / 0.0127f : 0.0f;
+  return (s > 0.05f) ? (s - 0.0059f) / 0.0127f * RIGHT_FF_LOAD_FACTOR : 0.0f;
 }
 
 // ─── Motor helpers ────────────────────────────────────────────────────────────
@@ -391,11 +422,21 @@ void updateSpeeds() {
 
   float dt = (now - lastSpeedCalcUS) * 1e-6f;
 
-  // Raw speed from encoder pulse count over the 50 ms window.
+  // Raw speed from encoder pulse count over the 200 ms window.
   float rawL = (lp - lastLeftPulses)  * METERS_PER_PULSE / dt;
   float rawR = (rp - lastRightPulses) * METERS_PER_PULSE / dt;
 
-  // Exponential moving average: α=0.4 → new sample weight 40%, history 60%.
+  // Outlier rejection: GPIO 34/35 have no internal pull-ups, so PWM
+  // switching noise can inject spurious pulses.  If the raw speed jumps
+  // by more than MAX_SPEED_JUMP in one window it is almost certainly noise
+  // (a real motor cannot accelerate that fast in 200 ms).  Discard it and
+  // hold the previous filtered value instead.
+  // MAX_SPEED_JUMP = 0.35 m/s per 200 ms = 1.75 m/s^2 (>> MAX_ACCEL_MS2).
+  const float MAX_SPEED_JUMP = 0.35f;
+  if (fabsf(rawL - leftSpeed)  > MAX_SPEED_JUMP) rawL = leftSpeed;
+  if (fabsf(rawR - rightSpeed) > MAX_SPEED_JUMP) rawR = rightSpeed;
+
+  // Exponential moving average: α=0.5 → new sample weight 50%, history 50%.
   leftSpeed  = SPEED_FILTER_ALPHA * rawL + (1.0f - SPEED_FILTER_ALPHA) * leftSpeed;
   rightSpeed = SPEED_FILTER_ALPHA * rawR + (1.0f - SPEED_FILTER_ALPHA) * rightSpeed;
 
@@ -411,14 +452,27 @@ void updateSpeeds() {
   lastLeftPulses  = lp;
   lastRightPulses = rp;
   lastSpeedCalcUS = now;
+  speedUpdatedThisCycle = true;   // signal PID to use fresh measurement
+  // Setpoint ramp runs in updateRamp() on its own 50 ms timer.
+}
 
-  // ── Setpoint ramp ─────────────────────────────────────────────────────────
+// ─── Setpoint ramp  (20 Hz, independent of speed estimation) ─────────────────
+// Running the ramp faster than the speed window ensures the reference
+// velocity advances smoothly even though measured speed only updates at 5 Hz.
+void updateRamp() {
+  unsigned long now = micros();
+  if (now - lastRampUS < RAMP_UPDATE_US) return;
+  float dt = (now - lastRampUS) * 1e-6f;
+  lastRampUS = now;
+
   const float max_step = MAX_ACCEL_MS2 * dt;
   leftPID.setpoint  += constrain(leftTargetSP  - leftPID.setpoint,  -max_step, max_step);
   rightPID.setpoint += constrain(rightTargetSP - rightPID.setpoint, -max_step, max_step);
 }
 
-// ─── Speed control  (~1 kHz) ──────────────────────────────────────────────────
+// ─── Speed control (tied to speed update, 5 Hz) ───────────────────────────────
+// The PID is driven only when a fresh speed measurement is available.
+
 void updateSpeedControl() {
   if (!speedCtrlEnabled) return;
 
@@ -430,38 +484,62 @@ void updateSpeedControl() {
 
   unsigned long now = micros();
   float dt = (now - lastCtrlUS) * 1e-6f;
-  if (dt < 0.001f) return;   // cap at 1 kHz
+  if (dt < 0.001f) return;   // still cap output loop at 1 kHz for slew
   lastCtrlUS = now;
 
-  // PID on filtered speed
-  float l_pid = pidUpdate(leftPID,  leftSpeed);
-  float r_pid = pidUpdate(rightPID, rightSpeed);
+  // PID: only recompute when a fresh speed measurement is available.
+  // With a 200 ms speed window, calling pidUpdate() 200 times with the
+  // same stale measured value accumulates integral 200x and produces a
+  // derivative of 0 for 199 calls then a spike on the 200th.
+  // The slew limiter below still runs at 1 kHz to keep the output smooth.
+  if (speedUpdatedThisCycle) {
+    speedUpdatedThisCycle = false;
 
-  // ── Sign correction ────────────────────────────────────────────────────────
-  // The PID operates on signed speed; the motor driver only accepts positive
-  // PWM with direction set separately.
-  // For backward motion (setpoint < 0):
-  //   error = setpoint - measured = -sp - (-v) = v - sp
-  //   Motor too slow  → v > sp → error negative → P negative
-  //   Without correction this subtracts from feedforward (wrong).
-  //   Negating restores: "too slow → more PWM" for both directions.
-  if (leftPID.setpoint  < 0.0f) l_pid = -l_pid;
-  if (rightPID.setpoint < 0.0f) r_pid = -r_pid;
+    float l_pid = pidUpdate(leftPID,  leftSpeed);
+    float r_pid = pidUpdate(rightPID, rightSpeed);
 
-  // Desired PWM = feedforward (dominant) + PID correction (residual)
-  float l_target = leftFF(leftPID.setpoint)   + l_pid;
-  float r_target = rightFF(rightPID.setpoint) + r_pid;
+    if (leftPID.setpoint  < 0.0f) l_pid = -l_pid;
+    if (rightPID.setpoint < 0.0f) r_pid = -r_pid;
 
-  // ── PWM slew-rate limiter ──────────────────────────────────────────────────
-  // Caps the rate of change of the actual PWM to PWM_SLEW_RATE units/s.
-  // At 1 kHz: max step = 0.3 PWM/call.  Smooths the startup jump when
-  // feedforward activates and absorbs large sudden PID corrections.
+    // Update slew targets with new PID output
+    leftPWMSlewed  = leftFF(leftPID.setpoint)   + l_pid;
+    rightPWMSlewed = rightFF(rightPID.setpoint) + r_pid;
+  }
+
+  // PWM slew-rate limiter runs every call (1 kHz) — smoothly advances the
+  // actual output toward the last computed target between PID updates.
   float max_slew = PWM_SLEW_RATE * dt;
-  leftPWMSlewed  = constrain(l_target, leftPWMSlewed  - max_slew, leftPWMSlewed  + max_slew);
-  rightPWMSlewed = constrain(r_target, rightPWMSlewed - max_slew, rightPWMSlewed + max_slew);
+  float l_out = constrain((float)leftPWM  + constrain(leftPWMSlewed  - (float)leftPWM,  -max_slew, max_slew), 0.0f, (float)MAX_PWM);
+  float r_out = constrain((float)rightPWM + constrain(rightPWMSlewed - (float)rightPWM, -max_slew, max_slew), 0.0f, (float)MAX_PWM);
 
-  applyLeftPWM( constrain((int)roundf(leftPWMSlewed),  0, MAX_PWM));
-  applyRightPWM(constrain((int)roundf(rightPWMSlewed), 0, MAX_PWM));
+  // Synchronized startup: prevent one motor from pulling ahead of the other
+  // during the ramp-up phase.  Without this, the motor with the lower target
+  // PWM (typically left, at 13.5 vs right at 15.3+) reaches its operating
+  // speed first and the robot yaws before both motors are running.
+  // Clamp each motor's output to the same FRACTION of its target as the
+  // motor that is farthest behind.  Once both are within 1 PWM of their
+  // targets the sync is released and they track independently.
+  if (leftPWMSlewed > 1.0f && rightPWMSlewed > 1.0f) {
+    float l_frac = l_out / leftPWMSlewed;
+    float r_frac = r_out / rightPWMSlewed;
+    float min_frac = min(l_frac, r_frac);
+    // Only synchronize while still ramping up (below 95% of target)
+    if (min_frac < 0.95f) {
+      l_out = min(l_out, leftPWMSlewed  * min_frac + max_slew);
+      r_out = min(r_out, rightPWMSlewed * min_frac + max_slew);
+    }
+  }
+
+  // Dead zone clamping: when motion is commanded, never let the output fall
+  // below the dead zone threshold.  Without this, any PID over-correction
+  // stalls the motor; error then builds up and the motor surges back on,
+  // creating the limit cycle (jerk) at low speeds.
+  // Only applied when |setpoint| > 0.05 (i.e., motion is actually requested).
+  if (fabsf(leftPID.setpoint)  > 0.05f) l_out = max(l_out, (float)LEFT_MIN_PWM);
+  if (fabsf(rightPID.setpoint) > 0.05f) r_out = max(r_out, (float)RIGHT_MIN_PWM);
+
+  applyLeftPWM( (int)roundf(l_out));
+  applyRightPWM((int)roundf(r_out));
 }
 
 // ─── Telemetry ────────────────────────────────────────────────────────────────
@@ -619,6 +697,7 @@ void setup() {
 
   lastSpeedCalcUS = micros();
   lastCtrlUS      = micros();
+  lastRampUS      = micros();
   lastCmdVelMS    = millis();
 
   Serial.println("READY");
@@ -628,9 +707,10 @@ void setup() {
 }
 
 void loop() {
-  updateSpeeds();
-  updateSpeedControl();
-  streamOdom();
+  updateSpeeds();         // 5 Hz  – speed estimation (200 ms window)
+  updateRamp();           // 20 Hz – setpoint advance
+  updateSpeedControl();   // 1 kHz – PID + slew + PWM
+  streamOdom();           // 20 Hz – telemetry
 
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
