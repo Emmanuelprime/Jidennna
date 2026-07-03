@@ -1,2 +1,0 @@
-{"event":"metadata","wall_time":1781527847.6638038,"wall_time_iso":"2026-06-15T13:50:47.663","metadata":{"test":true}}
-{"event":"cycle","wall_time":1781527847.6648033,"wall_time_iso":"2026-06-15T13:50:47.664","cycle":1,"sim_time":null,"estimated_state":null,"true_state":null,"feedback":{"distance_center":1.2},"control":[0.1,0.2],"wheel_commands":null,"reference_traj":null,"predicted_traj":null,"obstacle_status":null,"current_waypoint":null,"target_waypoint":null,"extra":{}}
