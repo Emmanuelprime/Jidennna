@@ -5,19 +5,41 @@ import serial.tools.list_ports
 import threading
 import time
 import re
+import sys
+import os
 from datetime import datetime
 
 class RobotGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Robot Control Panel")
+        self.root.title("Robot Control Panel - Cross Platform")
         self.root.geometry("900x700")
+        
+        # Detect platform
+        self.is_windows = sys.platform.startswith('win')
+        self.is_linux = sys.platform.startswith('linux')
+        self.is_jetson = self.is_linux and os.path.exists('/proc/device-tree/model')
+        
+        # Platform-specific settings
+        if self.is_jetson:
+            self.root.title("Robot Control Panel - Jetson Nano")
+            self.default_baud = 115200
+            # Common USB ports on Jetson
+            self.default_ports = ['/dev/ttyUSB0', '/dev/ttyACM0', '/dev/ttyTHS1']
+        elif self.is_windows:
+            self.default_baud = 115200
+            self.default_ports = ['COM3', 'COM4', 'COM5', 'COM6']
+        else:  # Linux
+            self.default_baud = 115200
+            self.default_ports = ['/dev/ttyUSB0', '/dev/ttyACM0']
         
         # Serial connection variables
         self.serial_port = None
         self.is_connected = False
         self.reading_thread = None
         self.running = False
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 3
         
         # Robot state
         self.current_speed = 0.0
@@ -29,30 +51,42 @@ class RobotGUI:
         self.actual_linear = 0.0
         self.actual_omega = 0.0
         
+        # Connection monitoring
+        self.last_data_time = time.time()
+        self.connection_timeout = 5.0  # seconds
+        
         # Create GUI
         self.create_widgets()
         
         # Auto-detect available ports
         self.refresh_ports()
         
+        # Start connection monitor
+        self.monitor_connection()
+        
     def create_widgets(self):
         # Main container
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
+        # Platform info
+        platform_text = "Jetson Nano" if self.is_jetson else ("Windows" if self.is_windows else "Linux")
+        ttk.Label(main_frame, text=f"Platform: {platform_text}", font=('Arial', 10, 'bold')).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 5))
+        
         # Connection Frame
         conn_frame = ttk.LabelFrame(main_frame, text="Connection", padding="5")
-        conn_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        conn_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
         ttk.Label(conn_frame, text="Port:").grid(row=0, column=0, padx=5)
         self.port_var = tk.StringVar()
-        self.port_combo = ttk.Combobox(conn_frame, textvariable=self.port_var, width=15)
+        self.port_combo = ttk.Combobox(conn_frame, textvariable=self.port_var, width=20)
         self.port_combo.grid(row=0, column=1, padx=5)
         
         ttk.Label(conn_frame, text="Baud:").grid(row=0, column=2, padx=5)
-        self.baud_var = tk.StringVar(value="115200")
+        self.baud_var = tk.StringVar(value=str(self.default_baud))
         baud_combo = ttk.Combobox(conn_frame, textvariable=self.baud_var, 
-                                  values=["9600", "19200", "38400", "57600", "115200"], 
+                                  values=["9600", "19200", "38400", "57600", "115200", "230400"], 
                                   width=10)
         baud_combo.grid(row=0, column=3, padx=5)
         
@@ -67,7 +101,7 @@ class RobotGUI:
         
         # Control Frame
         ctrl_frame = ttk.LabelFrame(main_frame, text="Motion Control", padding="10")
-        ctrl_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        ctrl_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         
         # Forward/Reverse speed control
         ttk.Label(ctrl_frame, text="Speed (m/s):").grid(row=0, column=0, padx=5, pady=5)
@@ -75,14 +109,22 @@ class RobotGUI:
         speed_scale = ttk.Scale(ctrl_frame, from_=0.0, to=1.2, variable=self.speed_var, 
                                orient=tk.HORIZONTAL, length=200)
         speed_scale.grid(row=0, column=1, padx=5, pady=5)
-        self.speed_label = ttk.Label(ctrl_frame, text="0.50")
+        self.speed_label = ttk.Label(ctrl_frame, text="0.50", width=6)
         self.speed_label.grid(row=0, column=2, padx=5)
         speed_scale.configure(command=lambda x: self.speed_label.configure(text=f"{float(x):.2f}"))
         
+        # Quick speed buttons
+        speed_btn_frame = ttk.Frame(ctrl_frame)
+        speed_btn_frame.grid(row=1, column=0, columnspan=3, pady=2)
+        for speed in [0.2, 0.5, 0.8, 1.0, 1.2]:
+            ttk.Button(speed_btn_frame, text=f"{speed:.1f}", width=5,
+                      command=lambda s=speed: self.set_speed(s)).pack(side=tk.LEFT, padx=2)
+        
         # Direction buttons
         btn_frame = ttk.Frame(ctrl_frame)
-        btn_frame.grid(row=1, column=0, columnspan=3, pady=10)
+        btn_frame.grid(row=2, column=0, columnspan=3, pady=10)
         
+        # Use Unicode arrows that work on both Windows and Linux
         ttk.Button(btn_frame, text="⬆ Forward", command=lambda: self.send_command('F'), 
                   width=12).grid(row=0, column=0, padx=5)
         ttk.Button(btn_frame, text="⬇ Reverse", command=lambda: self.send_command('R'), 
@@ -97,40 +139,40 @@ class RobotGUI:
                   width=12).grid(row=0, column=5, padx=5)
         
         # Spin speed control
-        ttk.Label(ctrl_frame, text="Spin Speed (rad/s):").grid(row=2, column=0, padx=5, pady=5)
+        ttk.Label(ctrl_frame, text="Spin Speed (rad/s):").grid(row=3, column=0, padx=5, pady=5)
         self.omega_var = tk.DoubleVar(value=1.0)
         omega_scale = ttk.Scale(ctrl_frame, from_=0.0, to=2.0, variable=self.omega_var, 
                                orient=tk.HORIZONTAL, length=200)
-        omega_scale.grid(row=2, column=1, padx=5, pady=5)
-        self.omega_label = ttk.Label(ctrl_frame, text="1.00")
-        self.omega_label.grid(row=2, column=2, padx=5)
+        omega_scale.grid(row=3, column=1, padx=5, pady=5)
+        self.omega_label = ttk.Label(ctrl_frame, text="1.00", width=6)
+        self.omega_label.grid(row=3, column=2, padx=5)
         omega_scale.configure(command=lambda x: self.omega_label.configure(text=f"{float(x):.2f}"))
         
         # Manual command input
-        ttk.Label(ctrl_frame, text="Manual Command:").grid(row=3, column=0, padx=5, pady=5)
+        ttk.Label(ctrl_frame, text="Manual Command:").grid(row=4, column=0, padx=5, pady=5)
         self.cmd_entry = ttk.Entry(ctrl_frame, width=20)
-        self.cmd_entry.grid(row=3, column=1, padx=5, pady=5)
-        ttk.Button(ctrl_frame, text="Send", command=self.send_manual_command).grid(row=3, column=2, padx=5)
+        self.cmd_entry.grid(row=4, column=1, padx=5, pady=5)
+        ttk.Button(ctrl_frame, text="Send", command=self.send_manual_command).grid(row=4, column=2, padx=5)
         
         # Status Frame (Right side)
         status_frame = ttk.LabelFrame(main_frame, text="Robot Status", padding="10")
-        status_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10), padx=(10, 0))
+        status_frame.grid(row=2, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10), padx=(10, 0))
         
         self.status_text = scrolledtext.ScrolledText(status_frame, width=40, height=12, font=('Courier', 9))
         self.status_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Telemetry Frame
         telemetry_frame = ttk.LabelFrame(main_frame, text="Telemetry", padding="10")
-        telemetry_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        telemetry_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
         # Create telemetry grid
         telemetry_labels = [
-            ("Left Speed:", "left_speed", "0.000"),
-            ("Right Speed:", "right_speed", "0.000"),
+            ("Left Speed (m/s):", "left_speed", "0.000"),
+            ("Right Speed (m/s):", "right_speed", "0.000"),
             ("Left PWM:", "left_pwm", "0"),
             ("Right PWM:", "right_pwm", "0"),
-            ("Actual Linear:", "actual_linear", "0.000"),
-            ("Actual Omega:", "actual_omega", "0.000")
+            ("Actual Linear (m/s):", "actual_linear", "0.000"),
+            ("Actual Omega (rad/s):", "actual_omega", "0.000")
         ]
         
         self.telemetry_vars = {}
@@ -145,7 +187,7 @@ class RobotGUI:
         
         # Console Frame
         console_frame = ttk.LabelFrame(main_frame, text="Console Output", padding="5")
-        console_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+        console_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         self.console_text = scrolledtext.ScrolledText(console_frame, height=10, font=('Courier', 9))
         self.console_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
@@ -153,15 +195,50 @@ class RobotGUI:
         # Configure grid weights
         main_frame.columnconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(3, weight=1)
+        main_frame.rowconfigure(4, weight=1)
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         
+    def set_speed(self, speed):
+        """Set the speed slider to a specific value"""
+        self.speed_var.set(speed)
+        self.speed_label.configure(text=f"{speed:.2f}")
+        
     def refresh_ports(self):
-        ports = [port.device for port in serial.tools.list_ports.comports()]
-        self.port_combo['values'] = ports
-        if ports:
-            self.port_combo.set(ports[0])
+        """Refresh the list of available serial ports"""
+        ports = []
+        try:
+            # Get all available ports
+            available_ports = [port.device for port in serial.tools.list_ports.comports()]
+            
+            # On Jetson/Linux, also check for common USB devices
+            if self.is_linux:
+                import glob
+                usb_ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+                for port in usb_ports:
+                    if port not in available_ports:
+                        available_ports.append(port)
+            
+            ports = available_ports
+            
+            # If no ports found, use default list
+            if not ports:
+                ports = self.default_ports
+            
+            self.port_combo['values'] = ports
+            
+            # Try to select the first available port or keep current selection
+            if self.port_var.get() in ports:
+                self.port_combo.set(self.port_var.get())
+            elif ports:
+                self.port_combo.set(ports[0])
+                
+        except Exception as e:
+            self.log_console(f"Error refreshing ports: {str(e)}")
+            # Fallback to default ports
+            self.port_combo['values'] = self.default_ports
+            if self.default_ports:
+                self.port_combo.set(self.default_ports[0])
         
     def toggle_connection(self):
         if not self.is_connected:
@@ -174,8 +251,20 @@ class RobotGUI:
             port = self.port_var.get()
             baud = int(self.baud_var.get())
             
+            self.log_console(f"Attempting to connect to {port} at {baud} baud...")
+            
+            # Platform-specific connection settings
+            if self.is_linux:
+                # On Linux, we might need to wait for the port to be ready
+                time.sleep(0.1)
+            
             self.serial_port = serial.Serial(port, baud, timeout=0.1)
+            
+            # Wait for connection to stabilize
+            time.sleep(0.5)
+            
             self.is_connected = True
+            self.reconnect_attempts = 0
             self.connect_btn.configure(text="Disconnect")
             self.status_label.configure(text="Connected", foreground="green")
             
@@ -188,6 +277,14 @@ class RobotGUI:
             self.send_command("PING")
             
             self.log_console(f"Connected to {port} at {baud} baud")
+            
+        except serial.SerialException as e:
+            error_msg = str(e)
+            if "Access denied" in error_msg or "Permission denied" in error_msg:
+                self.log_console(f"Permission denied. On Linux/Jetson, try: sudo chmod 666 {port}")
+            else:
+                self.log_console(f"Connection error: {error_msg}")
+            self.status_label.configure(text="Error", foreground="red")
             
         except Exception as e:
             self.log_console(f"Connection error: {str(e)}")
@@ -221,12 +318,17 @@ class RobotGUI:
             else:
                 full_cmd = f"{cmd}\n"
             
+            # Ensure the command is sent properly
             self.serial_port.write(full_cmd.encode())
+            self.serial_port.flush()
             self.log_console(f"Sent: {full_cmd.strip()}")
+            
+        except serial.SerialException as e:
+            self.log_console(f"Send error - connection lost: {str(e)}")
+            self.root.after(0, self.disconnect)
             
         except Exception as e:
             self.log_console(f"Send error: {str(e)}")
-            self.disconnect()
     
     def send_manual_command(self):
         cmd = self.cmd_entry.get()
@@ -250,8 +352,23 @@ class RobotGUI:
                         line = line.strip()
                         if line:
                             self.process_serial_line(line)
+                            self.last_data_time = time.time()
                             
+                # Check for timeout
+                elif self.is_connected and time.time() - self.last_data_time > self.connection_timeout:
+                    self.log_console("Connection timeout - no data received")
+                    self.running = False
+                    self.root.after(0, self.disconnect)
+                    break
+                    
                 time.sleep(0.01)
+                
+            except serial.SerialException as e:
+                if self.running:
+                    self.log_console(f"Serial error: {str(e)}")
+                    self.running = False
+                    self.root.after(0, self.disconnect)
+                break
                 
             except Exception as e:
                 if self.running:
@@ -286,7 +403,7 @@ class RobotGUI:
         
         # Check for READY response
         if line == "READY":
-            self.log_console("Robot ready")
+            self.log_console("Robot ready - communication established")
     
     def update_telemetry(self):
         self.telemetry_vars['left_speed'].set(f"{self.left_speed:.3f}")
@@ -303,9 +420,19 @@ class RobotGUI:
     def _append_console(self, message):
         self.console_text.insert(tk.END, message)
         self.console_text.see(tk.END)
-        # Limit console size
+        # Limit console size to prevent memory issues
         if int(self.console_text.index('end-1c').split('.')[0]) > 1000:
             self.console_text.delete('1.0', '2.0')
+    
+    def monitor_connection(self):
+        """Periodically check connection health"""
+        if self.is_connected:
+            # Send a ping every few seconds to keep connection alive
+            if time.time() - self.last_data_time > 2.0:
+                self.send_command("PING")
+        
+        # Schedule next check
+        self.root.after(3000, self.monitor_connection)
     
     def on_closing(self):
         self.running = False
@@ -313,7 +440,21 @@ class RobotGUI:
         self.root.destroy()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = RobotGUI(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+    # Set up for better cross-platform compatibility
+    if sys.platform.startswith('linux'):
+        # On Linux, we might need to run with sudo for serial access
+        try:
+            root = tk.Tk()
+            app = RobotGUI(root)
+            root.protocol("WM_DELETE_WINDOW", app.on_closing)
+            root.mainloop()
+        except Exception as e:
+            print(f"Error: {e}")
+            print("On Linux/Jetson, you may need to:")
+            print("  sudo chmod 666 /dev/ttyUSB*")
+            print("  or add your user to the dialout group: sudo usermod -a -G dialout $USER")
+    else:
+        root = tk.Tk()
+        app = RobotGUI(root)
+        root.protocol("WM_DELETE_WINDOW", app.on_closing)
+        root.mainloop()
