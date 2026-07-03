@@ -24,7 +24,6 @@ class RobotGUI:
         if self.is_jetson:
             self.root.title("Robot Control Panel - Jetson Nano")
             self.default_baud = 115200
-            # Common USB ports on Jetson
             self.default_ports = ['/dev/ttyUSB0', '/dev/ttyACM0', '/dev/ttyTHS1']
         elif self.is_windows:
             self.default_baud = 115200
@@ -120,23 +119,23 @@ class RobotGUI:
             ttk.Button(speed_btn_frame, text=f"{speed:.1f}", width=5,
                       command=lambda s=speed: self.set_speed(s)).pack(side=tk.LEFT, padx=2)
         
-        # Direction buttons
+        # Direction buttons - Using simple text to avoid X11 rendering issues
         btn_frame = ttk.Frame(ctrl_frame)
         btn_frame.grid(row=2, column=0, columnspan=3, pady=10)
         
-        # Use Unicode arrows that work on both Windows and Linux
-        ttk.Button(btn_frame, text="⬆ Forward", command=lambda: self.send_command('F'), 
-                  width=12).grid(row=0, column=0, padx=5)
-        ttk.Button(btn_frame, text="⬇ Reverse", command=lambda: self.send_command('R'), 
-                  width=12).grid(row=0, column=1, padx=5)
-        ttk.Button(btn_frame, text="↺ Spin Left", command=lambda: self.send_command('L'), 
-                  width=12).grid(row=0, column=2, padx=5)
-        ttk.Button(btn_frame, text="↻ Spin Right", command=lambda: self.send_command('B'), 
-                  width=12).grid(row=0, column=3, padx=5)
-        ttk.Button(btn_frame, text="⏹ Stop", command=lambda: self.send_command('s'), 
-                  width=12).grid(row=0, column=4, padx=5)
-        ttk.Button(btn_frame, text="Zero Encoders", command=lambda: self.send_command('z'), 
-                  width=12).grid(row=0, column=5, padx=5)
+        # Use simple text buttons instead of Unicode arrows
+        ttk.Button(btn_frame, text="Forward", command=lambda: self.send_command('F'), 
+                  width=10).grid(row=0, column=0, padx=5)
+        ttk.Button(btn_frame, text="Reverse", command=lambda: self.send_command('R'), 
+                  width=10).grid(row=0, column=1, padx=5)
+        ttk.Button(btn_frame, text="Spin L", command=lambda: self.send_command('L'), 
+                  width=10).grid(row=0, column=2, padx=5)
+        ttk.Button(btn_frame, text="Spin R", command=lambda: self.send_command('B'), 
+                  width=10).grid(row=0, column=3, padx=5)
+        ttk.Button(btn_frame, text="Stop", command=lambda: self.send_command('s'), 
+                  width=10).grid(row=0, column=4, padx=5)
+        ttk.Button(btn_frame, text="Zero", command=lambda: self.send_command('z'), 
+                  width=10).grid(row=0, column=5, padx=5)
         
         # Spin speed control
         ttk.Label(ctrl_frame, text="Spin Speed (rad/s):").grid(row=3, column=0, padx=5, pady=5)
