@@ -12,8 +12,8 @@ from datetime import datetime
 class RobotGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Robot Control Panel - IMU Enhanced")
-        self.root.geometry("1000x800")
+        self.root.title("Robot Control Panel - IMU & Odometry")
+        self.root.geometry("1100x850")
         
         # Detect platform
         self.is_windows = sys.platform.startswith('win')
@@ -51,6 +51,8 @@ class RobotGUI:
         self.actual_omega = 0.0
         self.actual_omega_imu = 0.0
         self.yaw = 0.0
+        self.odom_x = 0.0
+        self.odom_y = 0.0
         
         # Connection monitoring
         self.last_data_time = time.time()
@@ -59,11 +61,6 @@ class RobotGUI:
         self.last_ping_time = time.time()
         self.ping_retries = 0
         self.max_ping_retries = 3
-        
-        # Arc turn mode
-        self.arc_mode = False
-        self.arc_linear = 0.0
-        self.arc_angular = 0.0
         
         # Create GUI
         self.create_widgets()
@@ -81,7 +78,7 @@ class RobotGUI:
         
         # Platform info
         platform_text = "Jetson Nano" if self.is_jetson else ("Windows" if self.is_windows else "Linux")
-        ttk.Label(main_frame, text=f"Platform: {platform_text} | IMU-Enhanced Robot", 
+        ttk.Label(main_frame, text=f"Platform: {platform_text} | IMU & Odometry Robot", 
                  font=('Arial', 10, 'bold')).grid(
             row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 5))
         
@@ -135,7 +132,7 @@ class RobotGUI:
             ttk.Button(speed_btn_frame, text=f"{speed:.1f}", width=5,
                       command=lambda s=speed: self.set_speed(s)).pack(side=tk.LEFT, padx=2)
         
-        # Direction buttons with IMU support
+        # Direction buttons
         btn_frame = ttk.Frame(ctrl_frame)
         btn_frame.grid(row=2, column=0, columnspan=3, pady=10)
         
@@ -154,7 +151,7 @@ class RobotGUI:
         special_btn_frame = ttk.Frame(ctrl_frame)
         special_btn_frame.grid(row=3, column=0, columnspan=3, pady=5)
         
-        ttk.Button(special_btn_frame, text="Zero Encoders", command=lambda: self.send_command('z'), 
+        ttk.Button(special_btn_frame, text="Zero All", command=lambda: self.send_command('z'), 
                   width=12).pack(side=tk.LEFT, padx=2)
         ttk.Button(special_btn_frame, text="Calibrate IMU", command=lambda: self.send_command('C'), 
                   width=12).pack(side=tk.LEFT, padx=2)
@@ -176,7 +173,7 @@ class RobotGUI:
         self.cmd_entry = ttk.Entry(ctrl_frame, width=25)
         self.cmd_entry.grid(row=5, column=1, padx=5, pady=5)
         ttk.Button(ctrl_frame, text="Send", command=self.send_manual_command).grid(row=5, column=2, padx=5)
-        ttk.Label(ctrl_frame, text="(F/R/L/B/s/z/C/Vx,y)").grid(row=6, column=0, columnspan=3, pady=2)
+        ttk.Label(ctrl_frame, text="(F/R/L/B/s/z/C/Vx,y)", font=('Arial', 8)).grid(row=6, column=0, columnspan=3, pady=2)
         
         # Status Frame (Right side)
         status_frame = ttk.LabelFrame(main_frame, text="Robot Status", padding="10")
@@ -189,7 +186,7 @@ class RobotGUI:
         telemetry_frame = ttk.LabelFrame(main_frame, text="Telemetry", padding="10")
         telemetry_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
-        # Create telemetry grid with IMU data
+        # Create telemetry grid with odometry data
         telemetry_labels = [
             ("Left Speed (m/s):", "left_speed", "0.000"),
             ("Right Speed (m/s):", "right_speed", "0.000"),
@@ -198,18 +195,20 @@ class RobotGUI:
             ("Actual Linear (m/s):", "actual_linear", "0.000"),
             ("Actual Omega (enc):", "actual_omega", "0.000"),
             ("IMU Omega (rad/s):", "imu_omega", "0.000"),
-            ("Yaw (deg):", "yaw", "0.0")
+            ("Yaw (deg):", "yaw", "0.0"),
+            ("Odom X (m):", "odom_x", "0.000"),
+            ("Odom Y (m):", "odom_y", "0.000")
         ]
         
         self.telemetry_vars = {}
         for i, (label, key, default) in enumerate(telemetry_labels):
-            row = i // 4
-            col = (i % 4) * 2
+            row = i // 5
+            col = (i % 5) * 2
             ttk.Label(telemetry_frame, text=label).grid(row=row, column=col, padx=5, pady=2, sticky=tk.E)
             var = tk.StringVar(value=default)
             self.telemetry_vars[key] = var
             ttk.Label(telemetry_frame, textvariable=var, font=('Courier', 10), 
-                     width=10).grid(row=row, column=col+1, padx=5, pady=2, sticky=tk.W)
+                     width=12).grid(row=row, column=col+1, padx=5, pady=2, sticky=tk.W)
         
         # Console Frame
         console_frame = ttk.LabelFrame(main_frame, text="Console Output", padding="5")
@@ -229,7 +228,7 @@ class RobotGUI:
         """Open window for arc turn control"""
         arc_window = tk.Toplevel(self.root)
         arc_window.title("Arc Turn Control")
-        arc_window.geometry("400x250")
+        arc_window.geometry("400x300")
         arc_window.transient(self.root)
         arc_window.grab_set()
         
@@ -253,6 +252,11 @@ class RobotGUI:
         angular_label.grid(row=1, column=2, padx=5)
         angular_scale.configure(command=lambda x: angular_label.configure(text=f"{float(x):.2f}"))
         
+        # Info label
+        info_text = "Tip: Positive angular velocity = turn left,\nNegative = turn right"
+        ttk.Label(arc_window, text=info_text, font=('Arial', 8), foreground='gray').grid(
+            row=2, column=0, columnspan=3, pady=5)
+        
         def send_arc():
             v = linear_var.get()
             w = angular_var.get()
@@ -264,8 +268,11 @@ class RobotGUI:
             self.send_command('s')
             arc_window.destroy()
         
-        ttk.Button(arc_window, text="Execute Arc", command=send_arc, width=15).grid(row=2, column=0, padx=10, pady=20)
-        ttk.Button(arc_window, text="Cancel (Stop)", command=stop_arc, width=15).grid(row=2, column=1, padx=10, pady=20)
+        button_frame = ttk.Frame(arc_window)
+        button_frame.grid(row=3, column=0, columnspan=3, pady=20)
+        
+        ttk.Button(button_frame, text="Execute Arc", command=send_arc, width=15).pack(side=tk.LEFT, padx=10)
+        ttk.Button(button_frame, text="Cancel (Stop)", command=stop_arc, width=15).pack(side=tk.LEFT, padx=10)
         
     def set_speed(self, speed):
         """Set the speed slider to a specific value"""
@@ -503,20 +510,22 @@ class RobotGUI:
             self.log_console(f"< {line}")
             self.ping_retries = 0
         
-        # Parse telemetry data - Updated format for new firmware
+        # Parse telemetry data - Updated format with odometry
         if line.startswith('CNT,'):
             try:
                 parts = line.split(',')
-                if len(parts) >= 10:
-                    # CNT,time,vL,vR,linear,omega,actualOmega,yaw,leftPWM,rightPWM
+                if len(parts) >= 12:
+                    # CNT,time,vL,vR,linear,omega,actualOmega,yaw,x,y,leftPWM,rightPWM
                     self.left_speed = float(parts[2])
                     self.right_speed = float(parts[3])
                     self.actual_linear = float(parts[4])
                     self.actual_omega = float(parts[5])
                     self.actual_omega_imu = float(parts[6])
                     self.yaw = float(parts[7])
-                    self.left_pwm = int(parts[8])
-                    self.right_pwm = int(parts[9])
+                    self.odom_x = float(parts[8])
+                    self.odom_y = float(parts[9])
+                    self.left_pwm = int(parts[10])
+                    self.right_pwm = int(parts[11])
                     
                     # Update telemetry display
                     self.root.after(0, self.update_telemetry)
@@ -532,6 +541,8 @@ class RobotGUI:
         # Check for calibration messages
         if "IMU Calibrated" in line:
             self.log_console("IMU calibration completed successfully!")
+        if "Counters and odometry zeroed" in line:
+            self.log_console("Odometry reset to zero!")
     
     def update_telemetry(self):
         self.telemetry_vars['left_speed'].set(f"{self.left_speed:.3f}")
@@ -542,6 +553,8 @@ class RobotGUI:
         self.telemetry_vars['actual_omega'].set(f"{self.actual_omega:.3f}")
         self.telemetry_vars['imu_omega'].set(f"{self.actual_omega_imu:.3f}")
         self.telemetry_vars['yaw'].set(f"{self.yaw:.1f}")
+        self.telemetry_vars['odom_x'].set(f"{self.odom_x:.3f}")
+        self.telemetry_vars['odom_y'].set(f"{self.odom_y:.3f}")
     
     def log_console(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
